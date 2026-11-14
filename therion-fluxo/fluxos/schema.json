@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "therion-fluxo/fluxos/schema.json",
+  "title": "Template de fluxo (fluxos/<tipo_servico>.yaml)",
+  "description": "Estrutura do YAML. Regras de grafo (alcançabilidade, terminais, guardas) ficam em lib/templates.js#validarTemplate.",
+  "type": "object",
+  "required": ["tipo_servico", "nome_exibicao", "versao", "etapa_inicial", "etapas", "transicoes"],
+  "additionalProperties": false,
+  "properties": {
+    "tipo_servico": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+    "nome_exibicao": { "type": "string", "minLength": 1 },
+    "versao": { "type": "integer", "minimum": 1 },
+    "etapa_inicial": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+    "acao_na_criacao": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+    "etapas": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_]*$" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["nome", "diretoria"],
+        "additionalProperties": false,
+        "properties": {
+          "nome": { "type": "string", "minLength": 1 },
+          "diretoria": { "enum": ["comercial", "projetos", "financeiro", "administrativo"] },
+          "sla_horas": { "type": "number", "minimum": 1 },
+          "rodizio": { "type": "boolean" },
+          "terminal": { "type": "boolean" },
+          "status_projeto": { "enum": ["concluido", "abandonado"] },
+          "pasta": { "type": "string", "pattern": "^[0-9]{2}_[a-z0-9_]+$" }
+        }
+      }
+    },
+    "transicoes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["acao", "de", "para", "rotulo"],
+        "additionalProperties": false,
+        "properties": {
+          "acao": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+          "de": {
+            "anyOf": [
+              { "type": "string" },
+              { "type": "array", "minItems": 1, "items": { "type": "string" } }
+            ]
+          },
+          "para": { "type": "string" },
+          "rotulo": { "type": "string", "minLength": 1 },
+          "guarda": { "type": "string" },
+          "efeitos": { "type": "array", "items": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" } },
+          "campos": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["nome", "tipo"],
+              "additionalProperties": false,
+              "properties": {
+                "nome": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+                "rotulo": { "type": "string" },
+                "tipo": { "enum": ["text", "number", "money", "date", "enum", "arquivo", "membro"] },
+                "obrigatorio": { "type": "boolean" },
+                "sistema": { "type": "boolean" },
+                "min": { "type": "number" },
+                "max": { "type": "number" },
+                "opcoes": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+                "extensoes": { "type": "array", "items": { "type": "string" } }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

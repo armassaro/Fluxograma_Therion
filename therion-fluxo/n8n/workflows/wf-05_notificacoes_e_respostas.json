@@ -1,0 +1,267 @@
+{
+  "id": "therion-wf-05",
+  "name": "WF-05 Notificações e Respostas",
+  "active": false,
+  "nodes": [
+    {
+      "name": "Início",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "4772da2c-c507-4462-af50-b4422dbc7fd3",
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "Montar envios",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// ==== Módulos de lib/ embutidos por scripts/build_workflows.js. NÃO edite aqui: edite lib/ e rode `npm run build`. ====\nconst __mods = {}, __cache = {};\nfunction __req(n) { if (!n.startsWith('./')) return require(n); if (__cache[n]) return __cache[n].exports; if (!__mods[n]) throw new Error('módulo não embutido: ' + n); const module = { exports: {} }; __cache[n] = module; __mods[n](module, module.exports, __req); return module.exports; }\n__mods['./config'] = function (module, exports, require) {\n'use strict';\n/**\n * Converte variáveis de ambiente (strings) num objeto de configuração tipado.\n * Todo workflow/roteiro chama lerConfig() no início; nenhuma outra parte lê `env` direto.\n */\n\nfunction bool(v, padrao) {\n  if (v === undefined || v === null || v === '') return padrao;\n  return ['1', 'true', 'sim', 'yes', 'on'].includes(String(v).trim().toLowerCase());\n}\nfunction int(v, padrao) {\n  const n = parseInt(v, 10);\n  return Number.isFinite(n) ? n : padrao;\n}\nfunction lista(v, padrao) {\n  if (v === undefined || v === null || String(v).trim() === '') return padrao;\n  return String(v).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);\n}\n\n/**\n * @param {Record<string,string|undefined>} env  ex.: process.env ou $env do n8n\n */\nfunction lerConfig(env = {}) {\n  return {\n    tz: env.TZ || 'America/Sao_Paulo',\n    canais: {\n      telegram: bool(env.CANAL_TELEGRAM_ATIVO, true),\n      whatsapp: bool(env.CANAL_WHATSAPP_ATIVO, false),   // Fase 5\n      email: bool(env.CANAL_EMAIL_ATIVO, false),         // entrada por e-mail: Fase 3\n      forms: bool(env.CANAL_FORMS_ATIVO, false),         // Fase 3\n    },\n    notificacoes: {\n      telegram: bool(env.NOTIFICACAO_TELEGRAM_ATIVA, true),\n      whatsapp: bool(env.NOTIFICACAO_WHATSAPP_ATIVA, false),\n      email: bool(env.NOTIFICACAO_EMAIL_ATIVA, true),\n    },\n    features: {\n      rodizio: bool(env.FEATURE_RODIZIO, true),\n      reversao: bool(env.FEATURE_REVERSAO, true),\n      drive: bool(env.FEATURE_DRIVE, true),\n      fluxograma: bool(env.FEATURE_FLUXOGRAMA, false),      // Fase 3\n      iaDocumentos: bool(env.FEATURE_IA_DOCUMENTOS, false), // Fase 4\n      // TODO(ENVIO_AUTOMATICO_CLIENTE): quando implementado, o efeito `enviar_documento_cliente` usa esta flag.\n      envioAutomaticoCliente: bool(env.ENVIO_AUTOMATICO_CLIENTE, false),\n    },\n    sla: {\n      lembreteIntervaloHoras: int(env.LEMBRETE_INTERVALO_HORAS, 24),\n      escalonarAposLembretes: int(env.ESCALONAR_APOS_LEMBRETES, 2),\n      diasAutoAbandono: int(env.DIAS_AUTO_ABANDONO, 30),\n      horarioInicio: env.HORARIO_NOTIFICACAO_INICIO || '08:00',\n      horarioFim: env.HORARIO_NOTIFICACAO_FIM || '21:00',\n      notificarFimDeSemana: bool(env.NOTIFICAR_FIM_DE_SEMANA, false),\n      tz: env.TZ || 'America/Sao_Paulo',\n    },\n    exigirResponsavelAtribuido: bool(env.EXIGIR_RESPONSAVEL_ATRIBUIDO, false),\n    janelaReversaoHoras: int(env.JANELA_REVERSAO_HORAS, 48),\n    sessaoTtlMin: int(env.SESSAO_TTL_MIN, 30),\n    rateLimitPorMin: int(env.RATE_LIMIT_POR_MIN, 20),\n    arquivoTamanhoMaxMb: int(env.ARQUIVO_TAMANHO_MAX_MB, 20),\n    arquivoExtensoes: lista(env.ARQUIVO_EXTENSOES_PERMITIDAS,\n      ['pdf', 'png', 'jpg', 'jpeg', 'docx', 'xlsx', 'zip', 'stl', '3mf', 'step']),\n    driveRaizId: env.DRIVE_RAIZ_ID || '',\n    emailRemetente: env.EMAIL_REMETENTE || 'Therion Bot <fluxo@example.com>',\n    telegramApiBase: (env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\\/+$/, ''),\n  };\n}\n\nmodule.exports = { lerConfig };\n\n};\n__mods['./render'] = function (module, exports, require) {\n'use strict';\n/**\n * Renderização por canal: transforma mensagens neutras em \"envios\" prontos para o WF-05.\n *   telegram -> { canal:'telegram', membro_id, registrar, telegram: { metodo, corpo } }   (Bot API)\n *   email    -> { canal:'email',    membro_id, registrar, email: { para, assunto, texto } }\n */\n\nconst LIMITE_TELEGRAM = 4096;\n\n/** Quebra um texto longo em partes de até `limite`, preferindo quebras de linha. */\nfunction dividirTexto(texto, limite = LIMITE_TELEGRAM) {\n  const partes = [];\n  let resto = String(texto ?? '');\n  while (resto.length > limite) {\n    let corte = resto.lastIndexOf('\\n', limite);\n    if (corte < limite / 2) corte = limite;\n    partes.push(resto.slice(0, corte));\n    resto = resto.slice(corte).replace(/^\\n/, '');\n  }\n  if (resto || !partes.length) partes.push(resto);\n  return partes;\n}\n\n/** Só notificações vão para a tabela `notificacoes`; respostas diretas e mensagens sigilosas (código de vínculo) não. */\nfunction deveRegistrar(msg) { return !msg.resposta_direta && !msg.sigiloso; }\n\nfunction tecladoTelegram(botoes) {\n  if (!botoes || !botoes.length) return undefined;\n  return {\n    inline_keyboard: botoes.map((b) => [{\n      text: String(b.rotulo).slice(0, 60),\n      callback_data: String(b.dados).slice(0, 64),   // limite da Bot API\n    }]),\n  };\n}\n\nfunction renderTelegram(msg) {\n  const partes = dividirTexto(msg.texto || ' ');\n  return partes.map((texto, i) => {\n    const corpo = { chat_id: msg.destino, text: texto || ' ', disable_web_page_preview: true };\n    const teclado = i === partes.length - 1 ? tecladoTelegram(msg.botoes) : undefined;\n    if (teclado) corpo.reply_markup = teclado;\n    return { canal: 'telegram', membro_id: msg.membro_id || null, registrar: deveRegistrar(msg), telegram: { metodo: 'sendMessage', corpo } };\n  });\n}\n\nfunction renderEmail(msg) {\n  let texto = msg.texto || '';\n  if (msg.botoes && msg.botoes.length) texto += '\\n\\nPara agir, use o bot no Telegram.';\n  return [{\n    canal: 'email', membro_id: msg.membro_id || null, registrar: deveRegistrar(msg),\n    // essencial = sai mesmo com NOTIFICACAO_EMAIL_ATIVA=false (ex.: código de vínculo, que só existe por e-mail)\n    essencial: !!msg.sigiloso,\n    email: { para: msg.destino, assunto: msg.assunto || 'Therion Fluxo', texto },\n  }];\n}\n\n/**\n * @param {object[]} mensagens  [{canal, destino, texto, botoes?, assunto?, membro_id?}]\n * @param {{id:string}|null} callback  se a entrada foi um clique de botão, responde-o (tira o \"carregando\")\n */\nfunction montarEnvios(mensagens, callback = null) {\n  const envios = [];\n  if (callback && callback.id) {\n    envios.push({ canal: 'telegram', membro_id: null, registrar: false,\n      telegram: { metodo: 'answerCallbackQuery', corpo: { callback_query_id: callback.id } } });\n  }\n  for (const m of mensagens || []) {\n    if (!m || !m.destino) continue;\n    if (m.canal === 'telegram') envios.push(...renderTelegram(m));\n    else if (m.canal === 'email') envios.push(...renderEmail(m));\n  }\n  return envios;\n}\n\nmodule.exports = { montarEnvios, renderTelegram, renderEmail, dividirTexto, tecladoTelegram, LIMITE_TELEGRAM };\n\n};\n// ==== Fim dos módulos embutidos. Código do nó: ====\nconst { mensagens, callback } = $input.first().json;\nconst cfg = __req('./config').lerConfig($env);\nconst envios = __req('./render').montarEnvios(mensagens || [], callback || null)\n  // respeita as chaves gerais de notificação; respostas diretas no Telegram e e-mails essenciais\n  // (código de vínculo) sempre saem\n  .filter((e) => (e.canal === 'email' ? cfg.notificacoes.email || e.essencial : true));\nreturn envios.map((e) => ({ json: e }));"
+      },
+      "id": "a2024164-1c23-41be-aaac-7663ec8823fb",
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "name": "É Telegram?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-É Telegram?",
+              "leftValue": "={{ $json.canal === 'telegram' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "8016f435-9f56-49bf-a7c3-4e0f347bd720",
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "name": "Telegram",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\\/+$/, '') }}/bot{{ $env.TELEGRAM_BOT_TOKEN }}/{{ $json.telegram.metodo }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.telegram.corpo) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        }
+      },
+      "onError": "continueRegularOutput",
+      "id": "02049370-f096-4ef6-a46b-41f60e9b2c82",
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "name": "E-mail",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "credentials": {
+        "smtp": {
+          "id": "therion-smtp",
+          "name": "Therion SMTP"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "fromEmail": "={{ $env.EMAIL_REMETENTE || 'Therion Bot <fluxo@example.com>' }}",
+        "toEmail": "={{ $json.email.para }}",
+        "subject": "={{ $json.email.assunto }}",
+        "emailFormat": "text",
+        "text": "={{ $json.email.texto }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "4dad0b21-caad-44d8-ad65-b2eac2a51973",
+      "position": [
+        960,
+        0
+      ]
+    },
+    {
+      "name": "Resultado Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const envio = $('Montar envios').item.json;\nconst r = $json || {};\nconst ok = r.ok === true;\nreturn { json: { registrar: !!envio.registrar, membro_id: envio.membro_id, canal: 'telegram',\n  payload: envio.telegram, ok, erro: ok ? null : String(r.description || (r.error && (r.error.message || r.error)) || 'falha no envio') } };",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "010c4ad7-c37c-4c18-a179-27b16d599d3a",
+      "position": [
+        1200,
+        0
+      ]
+    },
+    {
+      "name": "Resultado E-mail",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const envio = $('Montar envios').item.json;\nconst r = $json || {};\nconst ok = !r.error;\nreturn { json: { registrar: !!envio.registrar, membro_id: envio.membro_id, canal: 'email',\n  payload: { para: envio.email.para, assunto: envio.email.assunto, texto: envio.email.texto },\n  ok, erro: ok ? null : String((r.error && (r.error.message || r.error)) || 'falha no envio') } };",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "c2a57930-4409-4c3d-a4da-278e9fba5876",
+      "position": [
+        0,
+        220
+      ]
+    },
+    {
+      "name": "Registrar envio",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "credentials": {
+        "postgres": {
+          "id": "therion-postgres",
+          "name": "Therion Postgres"
+        }
+      },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT registrar_envio($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json)] }}"
+        }
+      },
+      "id": "fa6be952-4c68-43cb-a60f-3eedbf0ee3b7",
+      "position": [
+        240,
+        220
+      ]
+    }
+  ],
+  "connections": {
+    "Início": {
+      "main": [
+        [
+          {
+            "node": "Montar envios",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Montar envios": {
+      "main": [
+        [
+          {
+            "node": "É Telegram?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "É Telegram?": {
+      "main": [
+        [
+          {
+            "node": "Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "E-mail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Telegram": {
+      "main": [
+        [
+          {
+            "node": "Resultado Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "E-mail": {
+      "main": [
+        [
+          {
+            "node": "Resultado E-mail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resultado Telegram": {
+      "main": [
+        [
+          {
+            "node": "Registrar envio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resultado E-mail": {
+      "main": [
+        [
+          {
+            "node": "Registrar envio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "therion-wf-99"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

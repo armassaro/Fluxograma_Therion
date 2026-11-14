@@ -1,0 +1,406 @@
+{
+  "id": "therion-wf-06",
+  "name": "WF-06 Drive",
+  "active": false,
+  "nodes": [
+    {
+      "name": "Início",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "2cbce008-384f-4c5b-af0f-74c96e2c4c44",
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "Criar pasta?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-Criar pasta?",
+              "leftValue": "={{ $json.op === 'criar_pasta_projeto' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "6f9853c1-cbcc-4d25-a1a9-282760c5ac92",
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "name": "Pasta do projeto",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "credentials": {
+        "googleApi": {
+          "id": "therion-google",
+          "name": "Therion Google (service account)"
+        }
+      },
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "folder",
+        "operation": "create",
+        "name": "={{ $json.codigo + ' - ' + $json.nome }}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.DRIVE_RAIZ_ID }}"
+        },
+        "options": {}
+      },
+      "id": "b2503717-69ba-4940-a6c7-5726c32e461d",
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "name": "Subpastas",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const pedido = $('Início').first().json;\nconst raiz = $input.first().json;\nreturn (pedido.subpastas || []).slice().sort().map((nome) => ({ json: { nome, pai: raiz.id } }));"
+      },
+      "id": "9ee487d3-021b-4878-a0c2-d9703d4eaa78",
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "name": "Criar subpasta",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "credentials": {
+        "googleApi": {
+          "id": "therion-google",
+          "name": "Therion Google (service account)"
+        }
+      },
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "folder",
+        "operation": "create",
+        "name": "={{ $json.nome }}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $json.pai }}"
+        },
+        "options": {}
+      },
+      "id": "42dc561b-d913-4c1d-abc0-a063aff3a3ad",
+      "position": [
+        960,
+        0
+      ]
+    },
+    {
+      "name": "Pastas criadas",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const pedido = $('Início').first().json;\nconst raiz = $('Pasta do projeto').first().json;\nconst nomes = $('Subpastas').all().map((i) => i.json.nome);\nconst pastas = {};\n$input.all().forEach((item, i) => { pastas[item.json.name || nomes[i]] = item.json.id; });\nreturn [{ json: { projeto_id: pedido.projeto_id, drive_pasta_id: raiz.id,\n  link: 'https://drive.google.com/drive/folders/' + raiz.id, pastas } }];"
+      },
+      "id": "6376dbd3-4073-4f66-a561-326cb0ccf692",
+      "position": [
+        1200,
+        0
+      ]
+    },
+    {
+      "name": "Gravar pastas",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "credentials": {
+        "postgres": {
+          "id": "therion-postgres",
+          "name": "Therion Postgres"
+        }
+      },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT definir_pastas_projeto($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json)] }}"
+        }
+      },
+      "id": "3454fc92-c905-405b-a936-0cb080e03727",
+      "position": [
+        0,
+        220
+      ]
+    },
+    {
+      "name": "Arquivos do Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const { arquivos, uploads } = $input.first().json;\nreturn (arquivos || []).map((a, indice) => ({ json: { ...a, indice, pasta_id: uploads.pasta_id || $env.DRIVE_RAIZ_ID, nome_final: (uploads.prefixo || '') + a.nome } }))\n  .filter((i) => i.json.origem === 'telegram' && !i.json.drive_file_id);"
+      },
+      "id": "490b3ae7-306a-4844-a829-f51044cd9b7b",
+      "position": [
+        240,
+        220
+      ]
+    },
+    {
+      "name": "getFile",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\\/+$/, '') }}/bot{{ $env.TELEGRAM_BOT_TOKEN }}/{{ 'getFile' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ file_id: $json.file_id }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        }
+      },
+      "id": "3f9cd28c-badd-4693-a888-0516eb640464",
+      "position": [
+        480,
+        220
+      ]
+    },
+    {
+      "name": "Baixar",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "GET",
+        "url": "={{ ($env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\\/+$/, '') }}/file/bot{{ $env.TELEGRAM_BOT_TOKEN }}/{{ $json.result.file_path }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          },
+          "timeout": 60000
+        }
+      },
+      "id": "3f24bf7f-866d-4a48-a31c-1da2805c5dc2",
+      "position": [
+        720,
+        220
+      ]
+    },
+    {
+      "name": "Enviar ao Drive",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "credentials": {
+        "googleApi": {
+          "id": "therion-google",
+          "name": "Therion Google (service account)"
+        }
+      },
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "file",
+        "operation": "upload",
+        "inputDataFieldName": "data",
+        "name": "={{ $('Arquivos do Telegram').item.json.nome_final }}",
+        "driveId": {
+          "__rl": true,
+          "mode": "list",
+          "value": "My Drive"
+        },
+        "folderId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $('Arquivos do Telegram').item.json.pasta_id }}"
+        },
+        "options": {}
+      },
+      "id": "dedd632e-bf69-4abb-a8f8-5b72798e0bb9",
+      "position": [
+        960,
+        220
+      ]
+    },
+    {
+      "name": "Arquivos no Drive",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// Devolve a lista COMPLETA de arquivos da ação, agora com a referência do Drive.\nconst original = $('Início').first().json.arquivos || [];\nconst enviados = $('Arquivos do Telegram').all().map((i) => i.json);\nconst noDrive = $input.all().map((i) => i.json);\nconst arquivos = original.map((a) => ({ ...a }));\nenviados.forEach((e, k) => {\n  const d = noDrive[k] || {};\n  if (!d.id) throw new Error('Upload ao Drive não retornou id para ' + e.nome);\n  arquivos[e.indice] = { campo: e.campo, nome: e.nome_final, mime: e.mime, tamanho: e.tamanho,\n    drive_file_id: d.id, url: d.webViewLink || ('https://drive.google.com/file/d/' + d.id + '/view') };\n});\nreturn [{ json: { arquivos } }];"
+      },
+      "id": "9aafbd4c-238e-4021-a4d7-ccec869552c9",
+      "position": [
+        1200,
+        220
+      ]
+    }
+  ],
+  "connections": {
+    "Início": {
+      "main": [
+        [
+          {
+            "node": "Criar pasta?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Criar pasta?": {
+      "main": [
+        [
+          {
+            "node": "Pasta do projeto",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Arquivos do Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pasta do projeto": {
+      "main": [
+        [
+          {
+            "node": "Subpastas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Subpastas": {
+      "main": [
+        [
+          {
+            "node": "Criar subpasta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Criar subpasta": {
+      "main": [
+        [
+          {
+            "node": "Pastas criadas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pastas criadas": {
+      "main": [
+        [
+          {
+            "node": "Gravar pastas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Arquivos do Telegram": {
+      "main": [
+        [
+          {
+            "node": "getFile",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "getFile": {
+      "main": [
+        [
+          {
+            "node": "Baixar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Baixar": {
+      "main": [
+        [
+          {
+            "node": "Enviar ao Drive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enviar ao Drive": {
+      "main": [
+        [
+          {
+            "node": "Arquivos no Drive",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "therion-wf-99"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

@@ -1,0 +1,88 @@
+{
+  "id": "therion-wf-99",
+  "name": "WF-99 Tratamento de Erros",
+  "active": false,
+  "nodes": [
+    {
+      "name": "Erro em workflow",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "parameters": {},
+      "id": "cd769ffd-37ad-4c09-a3e5-fe56e1e6b895",
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "Formatar alerta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// Sem dados pessoais: só workflow, nó, mensagem e id da execução.\nif (!$env.TELEGRAM_CHAT_ADMINS) return [];\nconst e = $input.first().json;\nconst ex = e.execution || {};\nconst texto = '🚨 Erro no n8n\\nWorkflow: ' + ((e.workflow && e.workflow.name) || '?')\n  + '\\nNó: ' + (ex.lastNodeExecuted || '?')\n  + '\\nErro: ' + String((ex.error && ex.error.message) || (e.trigger && e.trigger.error && e.trigger.error.message) || '?').slice(0, 500)\n  + '\\nExecução: ' + (ex.id || '?');\nreturn [{ json: { corpo: { chat_id: String($env.TELEGRAM_CHAT_ADMINS), text: texto } } }];"
+      },
+      "id": "fa5b0252-e1c4-4b58-a345-4ba9313241bc",
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "name": "Avisar administradores",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\\/+$/, '') }}/bot{{ $env.TELEGRAM_BOT_TOKEN }}/{{ 'sendMessage' }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.corpo) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 20000
+        }
+      },
+      "id": "df1a2d33-7535-4d3f-a002-66767e1ce2e8",
+      "position": [
+        480,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Erro em workflow": {
+      "main": [
+        [
+          {
+            "node": "Formatar alerta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Formatar alerta": {
+      "main": [
+        [
+          {
+            "node": "Avisar administradores",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

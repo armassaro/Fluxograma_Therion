@@ -1,0 +1,174 @@
+# Template de fluxo: Impressão e/ou Modelagem 3D
+# Formato documentado em docs/adicionar_servico.md e validado por lib/templates.js#validarTemplate.
+# Depois de editar: `npm run fluxos` (cria uma NOVA versão; projetos existentes ficam na antiga).
+tipo_servico: impressao_modelagem_3d
+nome_exibicao: "Impressão e/ou Modelagem 3D"
+versao: 3   # v3: criação já encaminha para Projetos
+etapa_inicial: registro_lead
+# Ao criar o projeto (/novo), esta ação é executada junto, na mesma transação: os campos dela são
+# perguntados no /novo e o projeto já nasce na etapa seguinte (Definição de escopo, diretoria Projetos).
+acao_na_criacao: enviar_para_escopo
+
+etapas:
+  registro_lead:                { nome: "Registro do lead",               diretoria: comercial,      sla_horas: 24,  pasta: 01_comercial }
+  definicao_escopo:             { nome: "Definição de escopo",            diretoria: projetos,       sla_horas: 72,  pasta: 02_escopo,    rodizio: true }
+  elaboracao_orcamento:         { nome: "Elaboração do orçamento",        diretoria: financeiro,     sla_horas: 48,  pasta: 03_orcamento, rodizio: true }
+  validacao_orcamento:          { nome: "Validação do orçamento",         diretoria: financeiro,     sla_horas: 24,  pasta: 03_orcamento }
+  aguardando_cliente_orcamento: { nome: "Aguardando resposta do cliente", diretoria: comercial,      sla_horas: 120, pasta: 03_orcamento }
+  negociacao:                   { nome: "Negociação/contraproposta",      diretoria: comercial,      sla_horas: 72,  pasta: 03_orcamento }
+  elaboracao_contrato:          { nome: "Elaboração do contrato",         diretoria: administrativo, sla_horas: 48,  pasta: 04_contrato,  rodizio: true }
+  validacao_contrato:           { nome: "Validação do contrato",          diretoria: administrativo, sla_horas: 24,  pasta: 04_contrato }
+  aguardando_assinatura:        { nome: "Aguardando assinatura",          diretoria: administrativo, sla_horas: 120, pasta: 04_contrato }
+  execucao:                     { nome: "Modelagem/Impressão",            diretoria: projetos,       sla_horas: 240, pasta: 05_execucao }
+  entrega:                      { nome: "Entrega e aceite do cliente",    diretoria: projetos,       sla_horas: 120, pasta: 06_entrega }
+  pagamento:                    { nome: "Pagamento",                      diretoria: financeiro,     sla_horas: 240, pasta: 07_financeiro }
+  concluido:                    { nome: "Concluído",  diretoria: administrativo, terminal: true, status_projeto: concluido }
+  abandonado:                   { nome: "Abandonado", diretoria: comercial,      terminal: true, status_projeto: abandonado }
+
+transicoes:
+  - acao: enviar_para_escopo
+    de: registro_lead
+    para: definicao_escopo
+    rotulo: "Enviar para Projetos"
+    campos:
+      - { nome: descricao_demanda, rotulo: "Descrição da demanda", tipo: text, obrigatorio: true }
+      - { nome: prazo_desejado,    rotulo: "Prazo desejado pelo cliente (dd/mm/aaaa)", tipo: date, obrigatorio: false }
+      - { nome: arquivo_cliente,   rotulo: "Arquivo/referência do cliente (.stl/.3mf/.step/.zip/.pdf/imagem)", tipo: arquivo, obrigatorio: false, extensoes: [stl, 3mf, step, zip, pdf, png, jpg, jpeg] }
+
+  - acao: enviar_escopo
+    de: definicao_escopo
+    para: elaboracao_orcamento
+    rotulo: "Escopo definido"
+    campos:
+      - { nome: escopo,                 rotulo: "Escopo do projeto",                  tipo: text,    obrigatorio: true }
+      - { nome: estimativa_filamento_g, rotulo: "Estimativa de filamento (g)",        tipo: number,  obrigatorio: true, min: 0 }
+      - { nome: material,               rotulo: "Material",                           tipo: enum,    obrigatorio: true, opcoes: [PLA, PETG, ABS, TPU, resina] }
+      - { nome: estimativa_horas,       rotulo: "Estimativa de horas de modelagem",   tipo: number,  obrigatorio: false, min: 0 }
+      - { nome: arquivo_modelo,         rotulo: "Arquivo do modelo (.stl/.3mf/.step)", tipo: arquivo, obrigatorio: false, extensoes: [stl, 3mf, step, zip] }
+    efeitos: [gerar_orcamento_ia]            # Fase 4; até lá o Financeiro elabora manualmente
+
+  - acao: orcamento_rascunho_pronto          # pelo sistema (IA, Fase 4) ou manualmente
+    de: elaboracao_orcamento
+    para: validacao_orcamento
+    rotulo: "Orçamento elaborado"
+    campos:
+      - { nome: arquivo_orcamento, rotulo: "Arquivo do orçamento", tipo: arquivo, obrigatorio: false }
+      - { nome: documento_id, tipo: text, obrigatorio: false, sistema: true }
+
+  - acao: aprovar_orcamento_interno
+    de: validacao_orcamento
+    para: aguardando_cliente_orcamento
+    rotulo: "Aprovar orçamento"
+    campos:
+      - { nome: valor_orcado, rotulo: "Valor orçado (R$)", tipo: money, obrigatorio: true, min: 0 }
+    efeitos: [marcar_documento_aprovado, exportar_pdf_orcamento, enviar_documento_cliente]  # último = no-op na v1
+
+  - acao: reprovar_orcamento_interno
+    de: validacao_orcamento
+    para: elaboracao_orcamento
+    rotulo: "Pedir correção do orçamento"
+    campos:
+      - { nome: motivo, rotulo: "Motivo", tipo: text, obrigatorio: true }
+    efeitos: [marcar_documento_reprovado, gerar_orcamento_ia]
+
+  - acao: cliente_aprovou
+    de: aguardando_cliente_orcamento
+    para: elaboracao_contrato
+    rotulo: "Cliente aprovou"
+    campos:
+      - { nome: comprovante_aprovacao, rotulo: "Comprovante da aprovação", tipo: arquivo, obrigatorio: false }
+    efeitos: [gerar_contrato_ia]
+
+  - acao: cliente_contraproposta
+    de: aguardando_cliente_orcamento
+    para: negociacao
+    rotulo: "Cliente fez contraproposta"
+    campos:
+      - { nome: detalhes_contraproposta, rotulo: "Detalhes da contraproposta", tipo: text, obrigatorio: true }
+
+  - acao: renegociar_escopo
+    de: negociacao
+    para: definicao_escopo
+    rotulo: "Revisar escopo"
+
+  - acao: renegociar_valor
+    de: negociacao
+    para: elaboracao_orcamento
+    rotulo: "Revisar valor"
+    efeitos: [gerar_orcamento_ia]
+
+  - acao: cliente_recusou
+    de: [aguardando_cliente_orcamento, negociacao]
+    para: abandonado
+    rotulo: "Cliente recusou"
+    campos:
+      - { nome: motivo, rotulo: "Motivo", tipo: text, obrigatorio: true }
+
+  - acao: contrato_rascunho_pronto
+    de: elaboracao_contrato
+    para: validacao_contrato
+    rotulo: "Contrato elaborado"
+    campos:
+      - { nome: arquivo_contrato, rotulo: "Arquivo do contrato", tipo: arquivo, obrigatorio: false }
+      - { nome: documento_id, tipo: text, obrigatorio: false, sistema: true }
+
+  - acao: aprovar_contrato_interno
+    de: validacao_contrato
+    para: aguardando_assinatura
+    rotulo: "Aprovar contrato"
+    efeitos: [marcar_documento_aprovado, exportar_pdf_contrato, enviar_documento_cliente]   # último = no-op na v1
+
+  - acao: reprovar_contrato_interno
+    de: validacao_contrato
+    para: elaboracao_contrato
+    rotulo: "Pedir correção do contrato"
+    campos:
+      - { nome: motivo, rotulo: "Motivo", tipo: text, obrigatorio: true }
+    efeitos: [marcar_documento_reprovado, gerar_contrato_ia]
+
+  # TODO(ASSINATURA_ELETRONICA): hoje o PDF assinado é enviado manualmente como arquivo desta ação.
+  - acao: contrato_assinado
+    de: aguardando_assinatura
+    para: execucao
+    rotulo: "Contrato assinado"
+    campos:
+      - { nome: contrato_assinado, rotulo: "PDF do contrato assinado", tipo: arquivo, obrigatorio: true }
+      - { nome: valor_contratado,  rotulo: "Valor contratado (R$)",    tipo: money,   obrigatorio: true, min: 0 }
+
+  - acao: concluir_execucao
+    de: execucao
+    para: entrega
+    rotulo: "Execução concluída"
+    campos:
+      - { nome: fotos_peca,       rotulo: "Foto da peça pronta",        tipo: arquivo, obrigatorio: true }
+      - { nome: filamento_real_g, rotulo: "Filamento realmente usado (g)", tipo: number,  obrigatorio: true, min: 0 }
+
+  - acao: ajustes_solicitados
+    de: entrega
+    para: execucao
+    rotulo: "Cliente pediu ajustes"
+    campos:
+      - { nome: ajustes, rotulo: "Ajustes solicitados", tipo: text, obrigatorio: true }
+
+  - acao: cliente_aceitou_entrega
+    de: entrega
+    para: pagamento
+    rotulo: "Cliente aceitou a entrega"
+    campos:
+      - { nome: forma_entrega, rotulo: "Forma de entrega", tipo: enum, obrigatorio: true, opcoes: [retirada, correio] }
+      - { nome: termo_aceite,  rotulo: "Termo de aceite",  tipo: arquivo, obrigatorio: false }
+
+  # Padrão da EJ: pagamento à vista (1 parcela). O self-loop existe só para casos excepcionais.
+  - acao: registrar_parcela
+    de: pagamento
+    para: pagamento
+    rotulo: "Registrar pagamento recebido"
+    campos:
+      - { nome: valor_pago,  rotulo: "Valor pago (R$)", tipo: money,   obrigatorio: true, min: 0 }
+      - { nome: comprovante, rotulo: "Comprovante",     tipo: arquivo, obrigatorio: true }
+
+  - acao: quitar
+    de: pagamento
+    para: concluido
+    rotulo: "Pagamento quitado"
+    guarda: "soma(registrar_parcela.valor_pago) >= projeto.valor_contratado"

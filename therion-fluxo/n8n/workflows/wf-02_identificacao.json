@@ -1,0 +1,65 @@
+{
+  "id": "therion-wf-02",
+  "name": "WF-02 Identificação",
+  "active": false,
+  "nodes": [
+    {
+      "name": "Início",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "ae6b1d3d-2b66-4ff9-adcf-572db93a1e8d",
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "Identificar",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "credentials": {
+        "postgres": {
+          "id": "therion-postgres",
+          "name": "Therion Postgres"
+        }
+      },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT ctx_entrada($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify({ canal: $json.canal, id_externo: $json.id_externo_remetente, idempotency_key: $json.idempotency_key, rate_limit: Number($env.RATE_LIMIT_POR_MIN || 20) })] }}"
+        }
+      },
+      "id": "94bc83f9-35b4-4c75-ae3f-30351d9e1c62",
+      "position": [
+        240,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Início": {
+      "main": [
+        [
+          {
+            "node": "Identificar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "therion-wf-99"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

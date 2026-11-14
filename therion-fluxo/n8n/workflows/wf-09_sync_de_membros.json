@@ -1,0 +1,205 @@
+{
+  "id": "therion-wf-09",
+  "name": "WF-09 Sync de Membros",
+  "active": false,
+  "nodes": [
+    {
+      "name": "A cada 15 minutos",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "id": "dccdc485-a730-47a0-ad89-1b123f4a466b",
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "Ler planilha",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "credentials": {
+        "googleApi": {
+          "id": "therion-google",
+          "name": "Therion Google (service account)"
+        }
+      },
+      "alwaysOutputData": true,
+      "parameters": {
+        "authentication": "serviceAccount",
+        "resource": "sheet",
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "={{ $env.SHEETS_MEMBROS_ID }}"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $env.SHEETS_MEMBROS_ABA || 'Membros' }}"
+        },
+        "options": {}
+      },
+      "id": "c12d8b95-0a7c-4cb4-aab0-2aee34d7710f",
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "name": "Validar linhas",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// ==== Módulos de lib/ embutidos por scripts/build_workflows.js. NÃO edite aqui: edite lib/ e rode `npm run build`. ====\nconst __mods = {}, __cache = {};\nfunction __req(n) { if (!n.startsWith('./')) return require(n); if (__cache[n]) return __cache[n].exports; if (!__mods[n]) throw new Error('módulo não embutido: ' + n); const module = { exports: {} }; __cache[n] = module; __mods[n](module, module.exports, __req); return module.exports; }\n__mods['./membros'] = function (module, exports, require) {\n'use strict';\n/**\n * Validação das linhas da planilha \"Membros EJ\" antes do sync (WF-09).\n * Colunas esperadas (cabeçalho, sem diferenciar maiúsculas/acentos):\n *   nome | email | telefone | diretoria | cargo | is_admin | ativo | disponivel | canal_preferido | canais_habilitados\n */\nconst { normalizar, chaveOrdenacao } = require('./texto');\n\nconst DIRETORIAS = ['comercial', 'projetos', 'financeiro', 'administrativo', 'presidencia'];\nconst CANAIS = ['telegram', 'email', 'whatsapp'];\n\nfunction bool(v, padrao) {\n  const s = normalizar(v);\n  if (s === '') return padrao;\n  return ['true', 'verdadeiro', 'sim', 's', 'x', '1', 'yes'].includes(s);\n}\n\n/** \"(11) 99999-9999\" -> \"+5511999999999\"; null se não parecer telefone brasileiro/E.164. */\nfunction telefoneE164(v) {\n  const s = String(v ?? '').trim();\n  if (!s) return null;\n  const d = s.replace(/\\D/g, '');\n  if (s.startsWith('+') && d.length >= 10 && d.length <= 15) return `+${d}`;\n  if (d.length === 10 || d.length === 11) return `+55${d}`;\n  if ((d.length === 12 || d.length === 13) && d.startsWith('55')) return `+${d}`;\n  return undefined; // presente, mas inválido\n}\n\n/** Aceita cabeçalhos como \"E-mail\", \"Diretoria \", \"Canal preferido\". */\nfunction chaveColuna(k) { return normalizar(k).replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, ''); }\n\n/**\n * @param {object[]} linhas  objetos {cabeçalho: valor} lidos da planilha\n * @returns {{validas: object[], erros: {linha:number, email:string, erro:string}[]}}\n */\nfunction validarLinhas(linhas) {\n  const validas = [], erros = [], vistos = new Set(), telefones = new Set();\n  (linhas || []).forEach((bruta, i) => {\n    const l = {};\n    for (const [k, v] of Object.entries(bruta || {})) l[chaveColuna(k)] = typeof v === 'string' ? v.trim() : v;\n    const numLinha = i + 2; // +1 do cabeçalho, +1 porque planilhas começam em 1\n    const email = String(l.email ?? l.e_mail ?? '').toLowerCase();\n    const nome = String(l.nome ?? '').trim();\n    if (!nome && !email) return; // linha em branco\n    const falha = (erro) => erros.push({ linha: numLinha, email, erro });\n\n    if (!nome) return falha('nome vazio');\n    if (!/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)) return falha('e-mail inválido');\n    if (vistos.has(email)) return falha('e-mail duplicado na planilha');\n    const diretoria = normalizar(l.diretoria);\n    if (!DIRETORIAS.includes(diretoria)) return falha(`diretoria inválida: \"${l.diretoria ?? ''}\"`);\n    const cargo = normalizar(l.cargo) || 'membro';\n    if (!['membro', 'diretor'].includes(cargo)) return falha(`cargo inválido: \"${l.cargo}\" (use membro ou diretor)`);\n\n    let telefone = telefoneE164(l.telefone);\n    if (telefone === undefined) { falha('telefone inválido (ignorado; membro importado sem telefone)'); telefone = null; }\n    if (telefone && telefones.has(telefone)) { falha('telefone repetido (ignorado)'); telefone = null; }\n    if (telefone) telefones.add(telefone);\n\n    let canais = String(l.canais_habilitados ?? '').split(/[,;\\s]+/).map(normalizar).filter((c) => CANAIS.includes(c));\n    if (!canais.length) canais = ['email', 'telegram'];\n    let preferido = normalizar(l.canal_preferido);\n    if (!CANAIS.includes(preferido)) preferido = 'email';\n\n    vistos.add(email);\n    validas.push({\n      nome, nome_ordenacao: chaveOrdenacao(nome), email, telefone_e164: telefone, diretoria, cargo,\n      is_admin: bool(l.is_admin, false), ativo: bool(l.ativo, true), disponivel: bool(l.disponivel, true),\n      canal_preferido: preferido, canais_habilitados: canais,\n    });\n  });\n  return { validas, erros };\n}\n\nmodule.exports = { validarLinhas, telefoneE164 };\n\n};\n__mods['./texto'] = function (module, exports, require) {\n'use strict';\n/**\n * Utilitários de texto e formatação (pt-BR). Sem dependências.\n */\n\nconst TZ_PADRAO = 'America/Sao_Paulo';\n\n/** Remove acentos: \"João\" -> \"Joao\". */\nfunction semAcento(s) {\n  return String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '');\n}\n\n/** Forma canônica para comparar textos digitados por pessoas (sem acento/caixa/espaços extras). */\nfunction normalizar(s) {\n  return semAcento(s).toLowerCase().replace(/\\s+/g, ' ').trim();\n}\n\n/**\n * Chave de ordenação alfabética de nomes usada pelo rodízio (coluna membros.nome_ordenacao).\n * É a ÚNICA fonte dessa normalização: o SQL apenas ordena pelo valor gravado.\n */\nfunction chaveOrdenacao(nome) {\n  return normalizar(nome);\n}\n\n/** \"2026-11-13T17:03:00Z\" -> \"13/11 14:03\" no fuso da EJ. */\nfunction fmtDataHora(iso, tz = TZ_PADRAO) {\n  if (!iso) return '—';\n  const d = new Date(iso);\n  if (Number.isNaN(d.getTime())) return String(iso);\n  const p = Object.fromEntries(\n    new Intl.DateTimeFormat('pt-BR', {\n      timeZone: tz, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,\n    }).formatToParts(d).map((x) => [x.type, x.value]),\n  );\n  return `${p.day}/${p.month} ${p.hour}:${p.minute}`;\n}\n\n/** 1234.5 -> \"R$ 1.234,50\". */\nfunction fmtMoeda(n) {\n  if (n === null || n === undefined || Number.isNaN(Number(n))) return '—';\n  const [int, dec] = Number(n).toFixed(2).split('.');\n  return `R$ ${int.replace(/\\B(?=(\\d{3})+(?!\\d))/g, '.')},${dec}`;\n}\n\nconst NOMES_DIRETORIA = {\n  comercial: 'Comercial', projetos: 'Projetos', financeiro: 'Financeiro',\n  administrativo: 'Administrativo', presidencia: 'Presidência',\n};\nfunction nomeDiretoria(d) { return NOMES_DIRETORIA[d] || String(d ?? '—'); }\n\nconst NOMES_STATUS = { ativo: 'ativo', pausado: 'pausado', concluido: 'concluído', abandonado: 'abandonado' };\nfunction nomeStatus(s) { return NOMES_STATUS[s] || String(s ?? '—'); }\n\nmodule.exports = { semAcento, normalizar, chaveOrdenacao, fmtDataHora, fmtMoeda, nomeDiretoria, nomeStatus, TZ_PADRAO };\n\n};\n// ==== Fim dos módulos embutidos. Código do nó: ====\nconst linhas = $input.all().map((i) => i.json);\nconst { validas, erros } = __req('./membros').validarLinhas(linhas);\nreturn [{ json: { linhas: validas, erros } }];"
+      },
+      "id": "0b6c20aa-73c4-41cf-a496-9f665c7acc2a",
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "name": "Aplicar sync",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "credentials": {
+        "postgres": {
+          "id": "therion-postgres",
+          "name": "Therion Postgres"
+        }
+      },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT sync_membros($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify({ linhas: $json.linhas })] }}"
+        }
+      },
+      "id": "3bf533ac-e220-467c-adb5-01d34697627f",
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "name": "Relatório",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// ==== Módulos de lib/ embutidos por scripts/build_workflows.js. NÃO edite aqui: edite lib/ e rode `npm run build`. ====\nconst __mods = {}, __cache = {};\nfunction __req(n) { if (!n.startsWith('./')) return require(n); if (__cache[n]) return __cache[n].exports; if (!__mods[n]) throw new Error('módulo não embutido: ' + n); const module = { exports: {} }; __cache[n] = module; __mods[n](module, module.exports, __req); return module.exports; }\n__mods['./config'] = function (module, exports, require) {\n'use strict';\n/**\n * Converte variáveis de ambiente (strings) num objeto de configuração tipado.\n * Todo workflow/roteiro chama lerConfig() no início; nenhuma outra parte lê `env` direto.\n */\n\nfunction bool(v, padrao) {\n  if (v === undefined || v === null || v === '') return padrao;\n  return ['1', 'true', 'sim', 'yes', 'on'].includes(String(v).trim().toLowerCase());\n}\nfunction int(v, padrao) {\n  const n = parseInt(v, 10);\n  return Number.isFinite(n) ? n : padrao;\n}\nfunction lista(v, padrao) {\n  if (v === undefined || v === null || String(v).trim() === '') return padrao;\n  return String(v).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);\n}\n\n/**\n * @param {Record<string,string|undefined>} env  ex.: process.env ou $env do n8n\n */\nfunction lerConfig(env = {}) {\n  return {\n    tz: env.TZ || 'America/Sao_Paulo',\n    canais: {\n      telegram: bool(env.CANAL_TELEGRAM_ATIVO, true),\n      whatsapp: bool(env.CANAL_WHATSAPP_ATIVO, false),   // Fase 5\n      email: bool(env.CANAL_EMAIL_ATIVO, false),         // entrada por e-mail: Fase 3\n      forms: bool(env.CANAL_FORMS_ATIVO, false),         // Fase 3\n    },\n    notificacoes: {\n      telegram: bool(env.NOTIFICACAO_TELEGRAM_ATIVA, true),\n      whatsapp: bool(env.NOTIFICACAO_WHATSAPP_ATIVA, false),\n      email: bool(env.NOTIFICACAO_EMAIL_ATIVA, true),\n    },\n    features: {\n      rodizio: bool(env.FEATURE_RODIZIO, true),\n      reversao: bool(env.FEATURE_REVERSAO, true),\n      drive: bool(env.FEATURE_DRIVE, true),\n      fluxograma: bool(env.FEATURE_FLUXOGRAMA, false),      // Fase 3\n      iaDocumentos: bool(env.FEATURE_IA_DOCUMENTOS, false), // Fase 4\n      // TODO(ENVIO_AUTOMATICO_CLIENTE): quando implementado, o efeito `enviar_documento_cliente` usa esta flag.\n      envioAutomaticoCliente: bool(env.ENVIO_AUTOMATICO_CLIENTE, false),\n    },\n    sla: {\n      lembreteIntervaloHoras: int(env.LEMBRETE_INTERVALO_HORAS, 24),\n      escalonarAposLembretes: int(env.ESCALONAR_APOS_LEMBRETES, 2),\n      diasAutoAbandono: int(env.DIAS_AUTO_ABANDONO, 30),\n      horarioInicio: env.HORARIO_NOTIFICACAO_INICIO || '08:00',\n      horarioFim: env.HORARIO_NOTIFICACAO_FIM || '21:00',\n      notificarFimDeSemana: bool(env.NOTIFICAR_FIM_DE_SEMANA, false),\n      tz: env.TZ || 'America/Sao_Paulo',\n    },\n    exigirResponsavelAtribuido: bool(env.EXIGIR_RESPONSAVEL_ATRIBUIDO, false),\n    janelaReversaoHoras: int(env.JANELA_REVERSAO_HORAS, 48),\n    sessaoTtlMin: int(env.SESSAO_TTL_MIN, 30),\n    rateLimitPorMin: int(env.RATE_LIMIT_POR_MIN, 20),\n    arquivoTamanhoMaxMb: int(env.ARQUIVO_TAMANHO_MAX_MB, 20),\n    arquivoExtensoes: lista(env.ARQUIVO_EXTENSOES_PERMITIDAS,\n      ['pdf', 'png', 'jpg', 'jpeg', 'docx', 'xlsx', 'zip', 'stl', '3mf', 'step']),\n    driveRaizId: env.DRIVE_RAIZ_ID || '',\n    emailRemetente: env.EMAIL_REMETENTE || 'Therion Bot <fluxo@example.com>',\n    telegramApiBase: (env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\\/+$/, ''),\n  };\n}\n\nmodule.exports = { lerConfig };\n\n};\n__mods['./guardas'] = function (module, exports, require) {\n'use strict';\n/**\n * Guardas de transição: mini-linguagem segura (sem eval) usada no campo `guarda` do template.\n *\n *   <termo> <op> <termo>          op: >= <= > < == !=\n *   termo:  123.45\n *         | projeto.<campo>               valor numérico do projeto\n *         | soma(<acao>.<campo>)          soma do campo nas ações NÃO revertidas daquele tipo\n *         | conta(<acao>)                 quantidade de ações não revertidas daquele tipo\n *\n * Ex.: \"soma(registrar_parcela.valor_pago) >= projeto.valor_contratado\"\n */\n\nconst RE_GUARDA = /^\\s*(.+?)\\s*(>=|<=|==|!=|>|<)\\s*(.+?)\\s*$/;\nconst RE_NUM = /^-?\\d+(\\.\\d+)?$/;\nconst RE_PROJETO = /^projeto\\.([a-z_][a-z0-9_]*)$/;\nconst RE_SOMA = /^soma\\(\\s*([a-z_][a-z0-9_]*)\\.([a-z_][a-z0-9_]*)\\s*\\)$/;\nconst RE_CONTA = /^conta\\(\\s*([a-z_][a-z0-9_]*)\\s*\\)$/;\n\nfunction parseTermo(t) {\n  let m;\n  if (RE_NUM.test(t)) return { tipo: 'numero', valor: Number(t) };\n  if ((m = RE_PROJETO.exec(t))) return { tipo: 'projeto', campo: m[1] };\n  if ((m = RE_SOMA.exec(t))) return { tipo: 'soma', acao: m[1], campo: m[2] };\n  if ((m = RE_CONTA.exec(t))) return { tipo: 'conta', acao: m[1] };\n  throw new Error(`termo de guarda inválido: \"${t}\"`);\n}\n\n/** Lança erro se a expressão for inválida (usado na validação do template). */\nfunction parseGuarda(expr) {\n  const m = RE_GUARDA.exec(String(expr ?? ''));\n  if (!m) throw new Error(`guarda inválida: \"${expr}\"`);\n  return { esquerda: parseTermo(m[1]), op: m[2], direita: parseTermo(m[3]) };\n}\n\nfunction valorTermo(t, estado) {\n  const efetivas = (estado.acoes || []).filter((a) => !a.revertida_por_id && a.tipo_acao !== 'reverter');\n  switch (t.tipo) {\n    case 'numero': return t.valor;\n    case 'projeto': {\n      const v = estado.projeto ? estado.projeto[t.campo] : null;\n      return v === null || v === undefined || v === '' ? null : Number(v);\n    }\n    case 'soma':\n      return efetivas.filter((a) => a.tipo_acao === t.acao)\n        .reduce((s, a) => s + (Number(a.dados?.[t.campo]) || 0), 0);\n    case 'conta': return efetivas.filter((a) => a.tipo_acao === t.acao).length;\n    default: return null;\n  }\n}\n\n/**\n * @param {string} expr\n * @param {{acoes: object[], projeto: object}} estado\n * @returns {{ok: boolean, esquerda: number|null, direita: number|null}}\n *          ok=false também quando algum lado não tem valor (ex.: valor_contratado ainda vazio)\n */\nfunction avaliarGuarda(expr, estado) {\n  const g = parseGuarda(expr);\n  const e = valorTermo(g.esquerda, estado);\n  const d = valorTermo(g.direita, estado);\n  if (e === null || d === null || Number.isNaN(e) || Number.isNaN(d)) return { ok: false, esquerda: e, direita: d };\n  const a = Math.round(e * 100), b = Math.round(d * 100); // compara em centavos (evita erro de ponto flutuante)\n  const ok = { '>=': a >= b, '<=': a <= b, '>': a > b, '<': a < b, '==': a === b, '!=': a !== b }[g.op];\n  return { ok, esquerda: e, direita: d };\n}\n\nmodule.exports = { parseGuarda, avaliarGuarda };\n\n};\n__mods['./mensagens'] = function (module, exports, require) {\n'use strict';\n/**\n * Textos e formatadores pt-BR mostrados aos membros. Tudo em texto puro (sem Markdown/HTML),\n * para que a mesma mensagem sirva a qualquer canal; lib/render.js adapta ao canal.\n */\nconst { fmtDataHora, fmtMoeda, nomeDiretoria, nomeStatus } = require('./texto');\nconst { ACOES_GLOBAIS } = require('./templates');\n\n/** Resposta padrão (§12). `botoes`: [{rotulo, dados}] */\nfunction resp(ok, codigo, mensagem, botoes = []) {\n  return { ok, codigo, mensagem, botoes };\n}\n\nconst AJUDA = [\n  'Comandos disponíveis:',\n  '/meus — projetos aguardando a sua diretoria',\n  '/projetos [filtro] — todos os projetos em andamento',\n  '/projeto P-AAAA-NNNN — detalhes e ações',\n  '/novo — registrar um novo projeto (Comercial)',\n  '/acao P-AAAA-NNNN <ação> [campo=valor ...] — executar uma ação',\n  '/historico P-AAAA-NNNN — histórico de ações',\n  '/comentar P-AAAA-NNNN <texto>',\n  '/pausar, /retomar, /abandonar, /reverter, /reatribuir P-AAAA-NNNN',\n  '/canal telegram|email — onde receber notificações',\n  '/ausente e /disponivel — sair/voltar do rodízio',\n  '/cancelar — cancelar a operação em andamento',\n].join('\\n');\n\nconst NAO_IDENTIFICADO = [\n  'Não reconheci você como membro da EJ.',\n  'Para vincular esta conta, envie:  /vincular seu.email@dominio',\n  'Você receberá um código por e-mail; depois envie:  /codigo 123456',\n  'Se o seu e-mail não estiver na planilha de membros, fale com a diretoria.',\n].join('\\n');\n\nconst ERROS = {\n  CONFLITO: (cod) => `O projeto foi alterado por outra pessoa agora há pouco. Confira com /projeto ${cod || ''} e tente de novo.`,\n  DUPLICADA: () => 'Esta ação já tinha sido registrada.',\n  NAO_AUTORIZADO: () => 'Você não tem permissão para esta ação.',\n  TRANSICAO_INVALIDA: (cod) => `Esta ação não é mais possível no estado atual do projeto. Confira com /projeto ${cod || ''}.`,\n  NADA_A_REVERTER: () => 'Não há nenhuma ação para reverter neste projeto.',\n  PROJETO_NAO_ENCONTRADO: () => 'Projeto não encontrado. Use /projetos para ver os códigos.',\n  RESPONSAVEL_INVALIDO: () => 'O novo responsável precisa ser um membro ativo da diretoria responsável pela etapa (administradores e Presidência podem escolher qualquer membro ativo).',\n  TIPO_INVALIDO: () => 'Tipo de serviço inexistente ou desativado.',\n  CAMPOS_FALTANTES: () => 'Faltam informações obrigatórias.',\n  VINCULO_INEXISTENTE: () => 'Não há pedido de vínculo em aberto (ou ele expirou). Envie /vincular seu.email@dominio de novo.',\n  CODIGO_INVALIDO: () => 'Código incorreto. Confira o e-mail e tente de novo (após 5 erros é preciso pedir outro código).',\n  CANAL_NAO_SUPORTADO: () => 'O vínculo por este canal ainda não está disponível.',\n};\nfunction mensagemErro(codigo, projetoCodigo) {\n  return (ERROS[codigo] || (() => `Não foi possível concluir (${codigo}).`))(projetoCodigo);\n}\n\nfunction rotuloAcao(tipo, template) {\n  if (ACOES_GLOBAIS[tipo]) return ACOES_GLOBAIS[tipo].rotulo;\n  if (tipo === 'criar_projeto') return 'Projeto criado';\n  const tr = (template?.transicoes || []).find((t) => t.acao === tipo);\n  return tr?.rotulo || tipo;\n}\n\nfunction linhaProjeto(p) {\n  const resp_ = p.responsavel_nome ? ` — ${p.responsavel_nome}` : '';\n  const pausa = p.status === 'pausado' ? ' ⏸' : '';\n  return `${p.codigo}${pausa} ${p.nome}\\n   ${p.etapa_nome} (${nomeDiretoria(p.diretoria)})${resp_}`;\n}\n\n/** Texto de detalhes de um projeto (_projeto_json). */\nfunction formatarProjeto(projeto, template) {\n  const e = projeto.etapa || {};\n  const linhas = [\n    `📁 ${projeto.codigo} — ${projeto.nome}`,\n    `Tipo: ${template?.nome_exibicao || projeto.tipo} · Status: ${nomeStatus(projeto.status)}`,\n    `Cliente: ${projeto.cliente?.nome || '—'}`,\n    `Etapa: ${e.nome || '—'} (${nomeDiretoria(e.diretoria_responsavel)})`,\n    `Responsável: ${e.responsavel_nome || 'toda a diretoria'}`,\n  ];\n  if (e.prazo_sla && projeto.status === 'ativo') linhas.push(`Prazo da etapa: ${fmtDataHora(e.prazo_sla)}`);\n  linhas.push(`Trazido por: ${projeto.membro_original_nome || '—'} · Início: ${fmtDataHora(projeto.data_inicio)}`);\n  const nums = [];\n  if (projeto.estimativa_horas != null) nums.push(`Estimativa: ${projeto.estimativa_horas} h`);\n  if (projeto.estimativa_filamento_g != null) nums.push(`Filamento: ${projeto.estimativa_filamento_g} g`);\n  if (projeto.valor_orcado != null) nums.push(`Orçado: ${fmtMoeda(projeto.valor_orcado)}`);\n  if (projeto.valor_contratado != null) nums.push(`Contratado: ${fmtMoeda(projeto.valor_contratado)}`);\n  if (nums.length) linhas.push(nums.join(' · '));\n  if (projeto.link_pasta_drive) linhas.push(`Pasta: ${projeto.link_pasta_drive}`);\n  return linhas.join('\\n');\n}\n\nfunction formatarHistorico(projeto, acoes, template) {\n  const linhas = [`🕓 Histórico de ${projeto.codigo} — ${projeto.nome}`];\n  for (const a of acoes) {\n    const destino = a.etapa_destino_nome && a.etapa_destino_id !== a.etapa_origem_id ? ` → ${a.etapa_destino_nome}` : '';\n    const rev = a.revertida_por_id ? ' [revertida]' : '';\n    linhas.push(`#${a.seq} ${fmtDataHora(a.criado_em)} — ${rotuloAcao(a.tipo_acao, template)} (${a.nome_responsavel})${destino}${rev}`);\n    if (a.observacoes) linhas.push(`     obs: ${a.observacoes}`);\n  }\n  return linhas.join('\\n');\n}\n\n/** Notificação padrão de mudança num projeto (§9). */\nfunction textoNotificacao(resultado, { rotulo, motivo }) {\n  const p = resultado.projeto, e = p.etapa || {}, a = resultado.acao;\n  const cabecalho = {\n    responsavel: '🔔 Você é o responsável por esta etapa',\n    diretoria: '🔔 Há um projeto aguardando a sua diretoria',\n    origem: 'ℹ️ Atualização de um projeto que você trouxe',\n    reversao: '↩️ Uma ação foi revertida num projeto em que você estava',\n  }[motivo] || '🔔 Atualização de projeto';\n  const linhas = [\n    cabecalho,\n    `[${p.codigo}] ${p.nome}`,\n    `Etapa: ${e.nome} (${nomeDiretoria(e.diretoria_responsavel)})` + (p.status !== 'ativo' ? ` · ${nomeStatus(p.status)}` : ''),\n    ...(['concluido', 'abandonado'].includes(p.status) ? [] : [`Responsável: ${e.responsavel_nome || 'toda a diretoria'}`]),\n    `Última ação: \"${rotulo}\" por ${a.nome_responsavel} — ${fmtDataHora(a.criado_em)}`,\n  ];\n  if (a.observacoes) linhas.push(`Obs: ${a.observacoes}`);\n  if (e.prazo_sla && p.status === 'ativo') linhas.push(`Prazo: ${fmtDataHora(e.prazo_sla)}`);\n  return linhas.join('\\n');\n}\n\nmodule.exports = {\n  resp, AJUDA, NAO_IDENTIFICADO, mensagemErro, rotuloAcao, linhaProjeto,\n  formatarProjeto, formatarHistorico, textoNotificacao,\n};\n\n};\n__mods['./notificacoes'] = function (module, exports, require) {\n'use strict';\n/**\n * Decide por qual canal cada pessoa é avisada e monta as mensagens de notificação (§9).\n * Saída: lista de \"mensagens\" neutras; lib/render.js converte em chamadas de cada canal.\n *   { membro_id, canal, destino, assunto, texto, botoes }\n */\nconst { textoNotificacao } = require('./mensagens');\n\n/**\n * Canal efetivo para um destinatário: o preferido, se estiver habilitado para ele e ligado\n * no sistema; senão o outro disponível (fallback). null = não há como avisar.\n */\nfunction resolverCanal(dest, cfg) {\n  const habilitados = dest.canais_habilitados || [];\n  const pode = {\n    telegram: cfg.notificacoes.telegram && !!dest.telegram_user_id && habilitados.includes('telegram'),\n    email: cfg.notificacoes.email && !!dest.email && habilitados.includes('email'),\n  };\n  if (pode[dest.canal_preferido]) return dest.canal_preferido;\n  if (pode.telegram) return 'telegram';\n  if (pode.email) return 'email';\n  // Último recurso: e-mail mesmo que o membro não o tenha listado, para ninguém ficar sem aviso.\n  if (cfg.notificacoes.email && dest.email) return 'email';\n  return null;\n}\n\n/**\n * @param {object} resultado  retorno de registrar_acao/criar_projeto (ok=true)\n * @param {{rotulo:string}} meta\n * @param {object} cfg\n */\nfunction montarNotificacoes(resultado, meta, cfg) {\n  const p = resultado.projeto;\n  const mensagens = [];\n  for (const d of resultado.destinatarios || []) {\n    const canal = resolverCanal(d, cfg);\n    if (!canal) continue;\n    mensagens.push({\n      membro_id: d.membro_id,\n      canal,\n      destino: canal === 'telegram' ? String(d.telegram_user_id) : d.email,\n      assunto: `[${p.codigo}] ${p.nome} — ${p.etapa?.nome || ''}`,\n      texto: textoNotificacao(resultado, { rotulo: meta.rotulo, motivo: d.motivo }),\n      botoes: canal === 'telegram' ? [{ rotulo: 'Ver projeto e ações', dados: `proj:${p.codigo}` }] : [],\n    });\n  }\n  return mensagens;\n}\n\nmodule.exports = { resolverCanal, montarNotificacoes };\n\n};\n__mods['./templates'] = function (module, exports, require) {\n'use strict';\n/**\n * Templates de fluxo (máquina de estados por tipo de serviço) e ações globais.\n * Um template é o conteúdo de fluxos/<tipo>.yaml já convertido em objeto.\n */\nconst { parseGuarda } = require('./guardas');\n\nconst DIRETORIAS = ['comercial', 'projetos', 'financeiro', 'administrativo'];\nconst TIPOS_CAMPO = ['text', 'number', 'money', 'date', 'enum', 'arquivo'];\nconst STATUS_TERMINAIS = ['concluido', 'abandonado'];\n\n/**\n * Ações globais: valem em qualquer etapa não-terminal e não aparecem no YAML (§6).\n * `tipo: membro` é resolvido pelo motor contra os membros da diretoria responsável.\n */\nconst ACOES_GLOBAIS = {\n  pausar: {\n    rotulo: 'Pausar projeto',\n    campos: [{ nome: 'motivo', rotulo: 'Motivo da pausa', tipo: 'text', obrigatorio: true }],\n  },\n  retomar: { rotulo: 'Retomar projeto', campos: [] },\n  abandonar: {\n    rotulo: 'Abandonar projeto',\n    campos: [{\n      nome: 'motivo', rotulo: 'Motivo do abandono', tipo: 'text', obrigatorio: true,\n      // Viram botões no Telegram; o usuário também pode digitar um motivo próprio.\n      sugestoes: [\n        'Cliente cancelou o projeto',\n        'Orçamento muito alto para o cliente',\n        'Tempo estimado em escopo muito alto',\n      ],\n    }],\n  },\n  reverter: { rotulo: 'Reverter última ação', campos: [] },\n  comentar: {\n    rotulo: 'Comentar',\n    campos: [\n      { nome: 'comentario', rotulo: 'Comentário', tipo: 'text', obrigatorio: true },\n      { nome: 'anexo', rotulo: 'Anexo', tipo: 'arquivo', obrigatorio: false },\n    ],\n  },\n  reatribuir: {\n    rotulo: 'Trocar responsável',\n    campos: [{ nome: 'novo_responsavel', rotulo: 'Novo responsável (pule para usar o rodízio)', tipo: 'membro', obrigatorio: false }],\n  },\n};\n\n/** Deixa o template numa forma única: `de` sempre lista, `campos`/`efeitos` sempre presentes. */\nfunction normalizarTemplate(def) {\n  const t = JSON.parse(JSON.stringify(def));\n  t.transicoes = (t.transicoes || []).map((tr) => ({\n    ...tr,\n    de: Array.isArray(tr.de) ? tr.de : [tr.de],\n    campos: tr.campos || [],\n    efeitos: tr.efeitos || [],\n  }));\n  return t;\n}\n\n/**\n * Valida um template já normalizado.\n * @returns {string[]} lista de erros (vazia = válido)\n */\nfunction validarTemplate(t) {\n  const erros = [];\n  const e = (m) => erros.push(m);\n  if (!t || typeof t !== 'object') return ['template vazio'];\n  if (!/^[a-z][a-z0-9_]*$/.test(t.tipo_servico || '')) e('tipo_servico ausente ou inválido (use minúsculas_e_sublinhado)');\n  if (!Number.isInteger(t.versao) || t.versao < 1) e('versao deve ser inteiro >= 1');\n  const etapas = t.etapas && typeof t.etapas === 'object' ? t.etapas : {};\n  const chaves = Object.keys(etapas);\n  if (!chaves.length) e('nenhuma etapa definida');\n  if (!etapas[t.etapa_inicial]) e(`etapa_inicial \"${t.etapa_inicial}\" não existe`);\n\n  for (const [k, et] of Object.entries(etapas)) {\n    if (!/^[a-z][a-z0-9_]*$/.test(k)) e(`etapa \"${k}\": chave inválida`);\n    if (!et.nome) e(`etapa \"${k}\": falta nome`);\n    if (!DIRETORIAS.includes(et.diretoria)) e(`etapa \"${k}\": diretoria inválida \"${et.diretoria}\"`);\n    if (et.terminal && !STATUS_TERMINAIS.includes(et.status_projeto)) e(`etapa terminal \"${k}\": status_projeto deve ser concluido ou abandonado`);\n    if (!et.terminal && et.sla_horas !== undefined && !(Number(et.sla_horas) > 0)) e(`etapa \"${k}\": sla_horas inválido`);\n  }\n  if (!etapas.abandonado || !etapas.abandonado.terminal) e('falta a etapa terminal \"abandonado\" (usada pela ação global abandonar)');\n\n  const vistos = new Set();\n  for (const tr of t.transicoes || []) {\n    const id = `transição \"${tr.acao}\"`;\n    if (!/^[a-z][a-z0-9_]*$/.test(tr.acao || '')) { e(`${id}: nome de ação inválido`); continue; }\n    if (ACOES_GLOBAIS[tr.acao] || tr.acao === 'criar_projeto') e(`${id}: nome reservado a uma ação global`);\n    // O botão do Telegram carrega \"acao:P-AAAA-NNNNNN:<acao>\" e o limite do callback_data é 64 bytes.\n    if (`acao:P-0000-000000:${tr.acao}`.length > 64) e(`${id}: nome longo demais para botão do Telegram`);\n    if (!etapas[tr.para]) e(`${id}: etapa de destino \"${tr.para}\" não existe`);\n    for (const de of tr.de || []) {\n      if (!etapas[de]) e(`${id}: etapa de origem \"${de}\" não existe`);\n      else if (etapas[de].terminal) e(`${id}: etapa terminal \"${de}\" não pode ter saída`);\n      if (vistos.has(`${de}|${tr.acao}`)) e(`${id}: duplicada a partir de \"${de}\"`);\n      vistos.add(`${de}|${tr.acao}`);\n    }\n    const nomes = new Set();\n    for (const c of tr.campos || []) {\n      if (!/^[a-z][a-z0-9_]*$/.test(c.nome || '')) e(`${id}: campo com nome inválido`);\n      if (nomes.has(c.nome)) e(`${id}: campo \"${c.nome}\" duplicado`);\n      nomes.add(c.nome);\n      if (!TIPOS_CAMPO.includes(c.tipo)) e(`${id}: campo \"${c.nome}\" com tipo inválido \"${c.tipo}\"`);\n      if (c.tipo === 'enum' && !(Array.isArray(c.opcoes) && c.opcoes.length)) e(`${id}: campo enum \"${c.nome}\" sem opcoes`);\n      if (c.nome === 'observacoes') e(`${id}: \"observacoes\" é um campo reservado`);\n    }\n    if (tr.guarda) { try { parseGuarda(tr.guarda); } catch (err) { e(`${id}: ${err.message}`); } }\n  }\n\n  if (t.acao_na_criacao !== undefined) {\n    const tr = (t.transicoes || []).find((x) => x.acao === t.acao_na_criacao && (x.de || []).includes(t.etapa_inicial));\n    if (!tr) e(`acao_na_criacao \"${t.acao_na_criacao}\" não é uma transição a partir da etapa inicial \"${t.etapa_inicial}\"`);\n    else if (tr.guarda) e(`acao_na_criacao \"${t.acao_na_criacao}\" não pode ter guarda`);\n    else if ((tr.campos || []).some((c) => c.tipo === 'membro' || (c.sistema && c.obrigatorio))) {\n      e(`acao_na_criacao \"${t.acao_na_criacao}\": campos do tipo membro ou de sistema obrigatórios não são suportados`);\n    }\n  }\n\n  // Grafo: toda etapa deve ser alcançável a partir da inicial; toda não-terminal deve ter saída.\n  if (etapas[t.etapa_inicial]) {\n    const alcancadas = new Set([t.etapa_inicial, 'abandonado']);\n    const fila = [t.etapa_inicial];\n    while (fila.length) {\n      const atual = fila.shift();\n      for (const tr of t.transicoes || []) {\n        if ((tr.de || []).includes(atual) && !alcancadas.has(tr.para)) { alcancadas.add(tr.para); fila.push(tr.para); }\n      }\n    }\n    for (const k of chaves) {\n      if (!alcancadas.has(k)) e(`etapa \"${k}\" é inalcançável a partir de \"${t.etapa_inicial}\"`);\n      if (!etapas[k].terminal && !(t.transicoes || []).some((tr) => (tr.de || []).includes(k) && tr.para !== k)) {\n        e(`etapa \"${k}\" não tem saída para outra etapa`);\n      }\n    }\n    if (!chaves.some((k) => etapas[k].terminal && etapas[k].status_projeto === 'concluido' && alcancadas.has(k))) {\n      e('nenhuma etapa terminal \"concluido\" alcançável');\n    }\n  }\n  return erros;\n}\n\nfunction etapaTerminal(tpl, chave) { return !!tpl?.etapas?.[chave]?.terminal; }\n\n/** Transições do template que partem da etapa informada. */\nfunction transicoesDisponiveis(tpl, chaveEtapa) {\n  return (tpl?.transicoes || []).filter((tr) => tr.de.includes(chaveEtapa));\n}\n\n/**\n * Definição de uma ação (global ou transição) no contexto de uma etapa.\n * @returns {{classe:'global'|'transicao', tipo:string, rotulo:string, campos:object[], para?:string, guarda?:string, efeitos:string[]}|null}\n */\nfunction definicaoAcao(tpl, chaveEtapa, tipoAcao) {\n  if (ACOES_GLOBAIS[tipoAcao]) {\n    const g = ACOES_GLOBAIS[tipoAcao];\n    return { classe: 'global', tipo: tipoAcao, rotulo: g.rotulo, campos: g.campos, efeitos: [] };\n  }\n  const tr = transicoesDisponiveis(tpl, chaveEtapa).find((x) => x.acao === tipoAcao);\n  if (!tr) return null;\n  return {\n    classe: 'transicao', tipo: tr.acao, rotulo: tr.rotulo || tr.acao, campos: tr.campos || [],\n    para: tr.para, guarda: tr.guarda, efeitos: tr.efeitos || [],\n  };\n}\n\nmodule.exports = {\n  DIRETORIAS, TIPOS_CAMPO, ACOES_GLOBAIS,\n  normalizarTemplate, validarTemplate, etapaTerminal, transicoesDisponiveis, definicaoAcao,\n};\n\n};\n__mods['./texto'] = function (module, exports, require) {\n'use strict';\n/**\n * Utilitários de texto e formatação (pt-BR). Sem dependências.\n */\n\nconst TZ_PADRAO = 'America/Sao_Paulo';\n\n/** Remove acentos: \"João\" -> \"Joao\". */\nfunction semAcento(s) {\n  return String(s ?? '').normalize('NFD').replace(/[̀-ͯ]/g, '');\n}\n\n/** Forma canônica para comparar textos digitados por pessoas (sem acento/caixa/espaços extras). */\nfunction normalizar(s) {\n  return semAcento(s).toLowerCase().replace(/\\s+/g, ' ').trim();\n}\n\n/**\n * Chave de ordenação alfabética de nomes usada pelo rodízio (coluna membros.nome_ordenacao).\n * É a ÚNICA fonte dessa normalização: o SQL apenas ordena pelo valor gravado.\n */\nfunction chaveOrdenacao(nome) {\n  return normalizar(nome);\n}\n\n/** \"2026-11-13T17:03:00Z\" -> \"13/11 14:03\" no fuso da EJ. */\nfunction fmtDataHora(iso, tz = TZ_PADRAO) {\n  if (!iso) return '—';\n  const d = new Date(iso);\n  if (Number.isNaN(d.getTime())) return String(iso);\n  const p = Object.fromEntries(\n    new Intl.DateTimeFormat('pt-BR', {\n      timeZone: tz, day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,\n    }).formatToParts(d).map((x) => [x.type, x.value]),\n  );\n  return `${p.day}/${p.month} ${p.hour}:${p.minute}`;\n}\n\n/** 1234.5 -> \"R$ 1.234,50\". */\nfunction fmtMoeda(n) {\n  if (n === null || n === undefined || Number.isNaN(Number(n))) return '—';\n  const [int, dec] = Number(n).toFixed(2).split('.');\n  return `R$ ${int.replace(/\\B(?=(\\d{3})+(?!\\d))/g, '.')},${dec}`;\n}\n\nconst NOMES_DIRETORIA = {\n  comercial: 'Comercial', projetos: 'Projetos', financeiro: 'Financeiro',\n  administrativo: 'Administrativo', presidencia: 'Presidência',\n};\nfunction nomeDiretoria(d) { return NOMES_DIRETORIA[d] || String(d ?? '—'); }\n\nconst NOMES_STATUS = { ativo: 'ativo', pausado: 'pausado', concluido: 'concluído', abandonado: 'abandonado' };\nfunction nomeStatus(s) { return NOMES_STATUS[s] || String(s ?? '—'); }\n\nmodule.exports = { semAcento, normalizar, chaveOrdenacao, fmtDataHora, fmtMoeda, nomeDiretoria, nomeStatus, TZ_PADRAO };\n\n};\n// ==== Fim dos módulos embutidos. Código do nó: ====\nconst r = $input.first().json.r;\nconst errosPlanilha = $('Validar linhas').first().json.erros || [];\nconst cfg = __req('./config').lerConfig($env);\nconst { resolverCanal, montarNotificacoes } = __req('./notificacoes');\nconst mensagens = [];\nif (r.ok) {\n  for (const n of r.novos || []) {\n    mensagens.push({ canal: 'email', destino: n.email, assunto: 'Bem-vindo(a) ao Therion Fluxo',\n      texto: 'Olá, ' + n.nome + '!\\n\\nVocê foi cadastrado(a) no sistema de fluxo de projetos da EJ.\\n'\n        + 'Para usar pelo Telegram, abra o bot e envie:  /vincular ' + n.email + '\\n' });\n  }\n  // quem recebeu etapas por reatribuição automática\n  for (const x of r.reatribuicoes || []) if (x.ok) mensagens.push(...montarNotificacoes(x, { rotulo: 'Trocar responsável' }, cfg));\n}\nconst linhas = [];\nif (!r.ok) linhas.push('Sync NÃO aplicado: ' + r.codigo + ' (a planilha está vazia ou ilegível?)');\nfor (const e of errosPlanilha) linhas.push('Linha ' + e.linha + ' (' + (e.email || 'sem e-mail') + '): ' + e.erro);\nfor (const e of (r.erros || [])) linhas.push((e.email || '?') + ': ' + e.erro);\nfor (const d of (r.desativados || [])) linhas.push('Desativado: ' + d.nome);\nif (linhas.length) {\n  const texto = '👥 Sync de membros\\n' + linhas.join('\\n');\n  for (const a of (r.admins || [])) {\n    const canal = resolverCanal(a, cfg);\n    if (canal) mensagens.push({ membro_id: a.membro_id, canal, destino: canal === 'telegram' ? String(a.telegram_user_id) : a.email, assunto: 'Sync de membros', texto });\n  }\n  if (!r.ok && $env.TELEGRAM_CHAT_ADMINS) mensagens.push({ canal: 'telegram', destino: String($env.TELEGRAM_CHAT_ADMINS), resposta_direta: true, texto });\n}\nreturn mensagens.length ? [{ json: { mensagens, callback: null } }] : [];"
+      },
+      "id": "6d954001-cc50-43d7-a9c8-679a6f502c8a",
+      "position": [
+        960,
+        0
+      ]
+    },
+    {
+      "name": "Enviar (WF-05)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "therion-wf-05"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "87ce1416-ef52-4c43-a7dc-ee7ef078d757",
+      "position": [
+        1200,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "A cada 15 minutos": {
+      "main": [
+        [
+          {
+            "node": "Ler planilha",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ler planilha": {
+      "main": [
+        [
+          {
+            "node": "Validar linhas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validar linhas": {
+      "main": [
+        [
+          {
+            "node": "Aplicar sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aplicar sync": {
+      "main": [
+        [
+          {
+            "node": "Relatório",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Relatório": {
+      "main": [
+        [
+          {
+            "node": "Enviar (WF-05)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "therion-wf-99"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

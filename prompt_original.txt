@@ -1,0 +1,72 @@
+[TIPOS_PROJETOS]
+	Impressão e/ou Modelagem 3D
+	Websites
+
+[INTERACAO_COM_FLUXO]
+	Bot no Whatsapp
+	E-mail
+	Bot no Telegram
+	Forms Google
+
+[NOTIFICACOES_DE_EVENTOS]
+	Bot no Whatsapp
+	E-mail 
+	Bot no Telegram
+	Forms Google
+
+[PLATAFORMA_ENDPOINT]
+	N8N
+	Bakcend próprio (considerar como opção menos provável)
+
+[OBSERVACOES_ENDPOINT]
+	Identificação de usuários no endpoint
+	Tailscale + Cloudflare pra expor o endpoint na Internet de forma segura
+
+- Cada projeto seria representado por um arquivo de logs, contendo o atual estado do projeto
+- Possibilidade de retroceder ações no fluxo do projeto
+- Conexão do endpoint com o Google Docs da EJ capaz de remover e inserir arquivos
+- Conexão do endpoint com uma planilha que contenha as informações dos usuários da EJ, para mais fácil identificação e validação dos usuários a cada requisição
+- Recurso de construção de fluxograma visual em imagem contendo o estado atual do projeto até então para os usuários que pedirem via canal de interação ao usuário
+- Conexão com IAs para geração de contratos e orçamentos com validação humana, enviando o documento em formato de notificação para os usuários da diretoria responsável da etapa
+- Alternância automática de pessoas responsáveis por cada etapa, como geração de contratos e orçamentos
+- Para passar para uma próxima etapa, é necessário enviar um conjunto de informações necessárias ou não em uma requisição (que representa uma ação dentro de um projeto)
+- Estrutura do projeto: Projeto(Etapa(Ação()))
+
+[ESTRUTURA_PROJETO]
+	ID: uuid (ID do projeto)
+	nome_lead: string (nome do lead que originou o projeto)
+	tipo: string (Impressão ou Modelagem 3D, Websites, outros serviços da nossa carta de serviços, sendo possível adicionar serviços de forma fácil e modular)
+	nome_membro_original: string (nome do membro que trouxe o projeto pra EJ)
+	etapa_atual: uuid (ID contendo a etapa atual onde o projeto se encontra)
+	data_inicio: string (data contendo o início onde o projeto começou)
+	data_final: string (data contendo o fim do projeto, com o projeto estando ocm status "concluído" ou "abandonado")
+	
+[ESTRUTURA_ETAPA]
+	ID: uuid (ID da etapa)
+	nome: string (nome da etapa)
+	diretoria_responsavel: string (nome da diretoria que responsável pela ação na etapa específica onde o projeto se encontra)
+	data_entrada: string (data onde o projeto entrou nessa etapa)
+
+[ESTRUTURA_ACAO]
+	ID: uuid (ID da etapa)
+	tipo_acao: string (ação que faz o projeto avançar ou voltar na etapa)
+	nome_responsavel: string (nome da pessoa que enviou a requisição que representa essa ação)
+	status: string (status do projeto atual, sendo: "ativo", "pausado", "concluído" ou "abandonado")
+	observacoes: string (possíveis observações na ação enviada)
+	arquivo_anexado: arquivo/referencia_arquivo (possível arquivo ou referência para um arquivo, que vai ser endereçado com a etapa atual do projeto)
+
+- Presença de variáveis de ambiente que ligam ou desligam determinadas funções do endpoint ou bot de telegram/whatsapp/e-mail
+- Restrição da interação com o endpoint conforme a etapa atual de cada projeto, ou seja, o usuário deve ser identificado e permitido ou não de enviar uma requisição para o endpoint conforme a diretoria pertencente do usuário que enviou a requisição e a diretoria responsável da etapa atual no projeto
+- Possibilidade de configurar o canal de interação do usuário (usuário escolhe se quer poder interagir com o endpoint e receber notificações pelo bot do Whatsapp, Telegram ou E-mail)
+
+[FLUXOGRAMA_APLICACAO]
+(usuario) <-> (canais de interação [Telegram, Whatsapp ou E-mail]) -> Docs/Drive
+
+- No fluxo, cada etapa representa um nó e cada ação representa uma aresta, como num grafo, enquanto o projeto representa o próprio grafo em si
+- Geralmente, o fluxo entre diretorias se passa pelo seguinte:
+	1. Comercial registra o lead com um novo projeto
+	2. Projetos define o escopo do projeto, contendo uma estimativa de horas trabalhadas ou de filamento gasto (para projetos de modelagem ou impressão 3D)
+	3. Financeiro cria o documento de orçamento, valida e envia pro cliente
+	4. Cliente aprova o projeto
+	5. Administrativo cria o contrato, valida e envia pro cliente
+	6. Projeto definido como "concluído"

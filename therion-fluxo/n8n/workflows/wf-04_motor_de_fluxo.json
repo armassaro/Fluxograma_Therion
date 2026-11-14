@@ -1,0 +1,255 @@
+{
+  "id": "therion-wf-04",
+  "name": "WF-04 Motor de Fluxo",
+  "active": false,
+  "nodes": [
+    {
+      "name": "Início",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "id": "e0512bf1-6e47-42ab-ad6f-da2abff0b127",
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "name": "Arquivos a subir",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// ==== Módulos de lib/ embutidos por scripts/build_workflows.js. NÃO edite aqui: edite lib/ e rode `npm run build`. ====\nconst __mods = {}, __cache = {};\nfunction __req(n) { if (!n.startsWith('./')) return require(n); if (__cache[n]) return __cache[n].exports; if (!__mods[n]) throw new Error('módulo não embutido: ' + n); const module = { exports: {} }; __cache[n] = module; __mods[n](module, module.exports, __req); return module.exports; }\n__mods['./config'] = function (module, exports, require) {\n'use strict';\n/**\n * Converte variáveis de ambiente (strings) num objeto de configuração tipado.\n * Todo workflow/roteiro chama lerConfig() no início; nenhuma outra parte lê `env` direto.\n */\n\nfunction bool(v, padrao) {\n  if (v === undefined || v === null || v === '') return padrao;\n  return ['1', 'true', 'sim', 'yes', 'on'].includes(String(v).trim().toLowerCase());\n}\nfunction int(v, padrao) {\n  const n = parseInt(v, 10);\n  return Number.isFinite(n) ? n : padrao;\n}\nfunction lista(v, padrao) {\n  if (v === undefined || v === null || String(v).trim() === '') return padrao;\n  return String(v).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);\n}\n\n/**\n * @param {Record<string,string|undefined>} env  ex.: process.env ou $env do n8n\n */\nfunction lerConfig(env = {}) {\n  return {\n    tz: env.TZ || 'America/Sao_Paulo',\n    canais: {\n      telegram: bool(env.CANAL_TELEGRAM_ATIVO, true),\n      whatsapp: bool(env.CANAL_WHATSAPP_ATIVO, false),   // Fase 5\n      email: bool(env.CANAL_EMAIL_ATIVO, false),         // entrada por e-mail: Fase 3\n      forms: bool(env.CANAL_FORMS_ATIVO, false),         // Fase 3\n    },\n    notificacoes: {\n      telegram: bool(env.NOTIFICACAO_TELEGRAM_ATIVA, true),\n      whatsapp: bool(env.NOTIFICACAO_WHATSAPP_ATIVA, false),\n      email: bool(env.NOTIFICACAO_EMAIL_ATIVA, true),\n    },\n    features: {\n      rodizio: bool(env.FEATURE_RODIZIO, true),\n      reversao: bool(env.FEATURE_REVERSAO, true),\n      drive: bool(env.FEATURE_DRIVE, true),\n      fluxograma: bool(env.FEATURE_FLUXOGRAMA, false),      // Fase 3\n      iaDocumentos: bool(env.FEATURE_IA_DOCUMENTOS, false), // Fase 4\n      // TODO(ENVIO_AUTOMATICO_CLIENTE): quando implementado, o efeito `enviar_documento_cliente` usa esta flag.\n      envioAutomaticoCliente: bool(env.ENVIO_AUTOMATICO_CLIENTE, false),\n    },\n    sla: {\n      lembreteIntervaloHoras: int(env.LEMBRETE_INTERVALO_HORAS, 24),\n      escalonarAposLembretes: int(env.ESCALONAR_APOS_LEMBRETES, 2),\n      diasAutoAbandono: int(env.DIAS_AUTO_ABANDONO, 30),\n      horarioInicio: env.HORARIO_NOTIFICACAO_INICIO || '08:00',\n      horarioFim: env.HORARIO_NOTIFICACAO_FIM || '21:00',\n      notificarFimDeSemana: bool(env.NOTIFICAR_FIM_DE_SEMANA, false),\n      tz: env.TZ || 'America/Sao_Paulo',\n    },\n    exigirResponsavelAtribuido: bool(env.EXIGIR_RESPONSAVEL_ATRIBUIDO, false),\n    janelaReversaoHoras: int(env.JANELA_REVERSAO_HORAS, 48),\n    sessaoTtlMin: int(env.SESSAO_TTL_MIN, 30),\n    rateLimitPorMin: int(env.RATE_LIMIT_POR_MIN, 20),\n    arquivoTamanhoMaxMb: int(env.ARQUIVO_TAMANHO_MAX_MB, 20),\n    arquivoExtensoes: lista(env.ARQUIVO_EXTENSOES_PERMITIDAS,\n      ['pdf', 'png', 'jpg', 'jpeg', 'docx', 'xlsx', 'zip', 'stl', '3mf', 'step']),\n    driveRaizId: env.DRIVE_RAIZ_ID || '',\n    emailRemetente: env.EMAIL_REMETENTE || 'Therion Bot <fluxo@example.com>',\n    telegramApiBase: (env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\\/+$/, ''),\n  };\n}\n\nmodule.exports = { lerConfig };\n\n};\n// ==== Fim dos módulos embutidos. Código do nó: ====\n// Arquivos recebidos pelo Telegram precisam ir para o Drive ANTES da gravação (a ação guarda o id do Drive).\n// Se o upload falhar, o workflow para aqui e a ação NÃO é registrada.\nconst operacao = $input.first().json.operacao;\nconst cfg = __req('./config').lerConfig($env);\nconst arquivos = (operacao.payload && operacao.payload.arquivos) || [];\nconst pendentes = arquivos.filter((a) => a.origem === 'telegram' && !a.drive_file_id);\nreturn [{ json: { operacao, precisaUpload: cfg.features.drive && pendentes.length > 0,\n  pedido: { op: 'subir_arquivos', arquivos, uploads: operacao.uploads || {} } } }];"
+      },
+      "id": "c5dfb637-fb6b-4ade-a270-a8deeb597ca4",
+      "position": [
+        240,
+        0
+      ]
+    },
+    {
+      "name": "Precisa de upload?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-Precisa de upload?",
+              "leftValue": "={{ $json.precisaUpload }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "1f6da3bb-d7ba-4a65-a6b7-ed9471e745d6",
+      "position": [
+        480,
+        0
+      ]
+    },
+    {
+      "name": "Pedido ao Drive",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "return [{ json: $input.first().json.pedido }];"
+      },
+      "id": "c6bda3f9-01ae-4723-a357-44d0a684542c",
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "name": "Drive (WF-06)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "therion-wf-06"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      },
+      "id": "d7e44f10-caa8-43df-afbd-0a21b6558c07",
+      "position": [
+        960,
+        0
+      ]
+    },
+    {
+      "name": "Operação final",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "const { operacao } = $('Arquivos a subir').first().json;\nconst payload = { ...operacao.payload };\nif ($('Drive (WF-06)').isExecuted) payload.arquivos = $('Drive (WF-06)').first().json.arquivos;\nreturn [{ json: { chamada: { fn: operacao.fn, payload } } }];"
+      },
+      "id": "515695d4-bc60-4e33-a1a3-1b839abc63bb",
+      "position": [
+        1200,
+        0
+      ]
+    },
+    {
+      "name": "Gravar",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "credentials": {
+        "postgres": {
+          "id": "therion-postgres",
+          "name": "Therion Postgres"
+        }
+      },
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT executar_operacao($1::jsonb) AS r",
+        "options": {
+          "queryReplacement": "={{ [JSON.stringify($json.chamada)] }}"
+        }
+      },
+      "id": "8db5d3c2-137b-430f-ac68-a5871cc78cc5",
+      "position": [
+        0,
+        220
+      ]
+    },
+    {
+      "name": "Resultado",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "return [{ json: { resultado: $input.first().json.r } }];"
+      },
+      "id": "46c53b78-00d4-4675-a0b3-ad18d13fd98d",
+      "position": [
+        240,
+        220
+      ]
+    }
+  ],
+  "connections": {
+    "Início": {
+      "main": [
+        [
+          {
+            "node": "Arquivos a subir",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Arquivos a subir": {
+      "main": [
+        [
+          {
+            "node": "Precisa de upload?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Precisa de upload?": {
+      "main": [
+        [
+          {
+            "node": "Pedido ao Drive",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Operação final",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pedido ao Drive": {
+      "main": [
+        [
+          {
+            "node": "Drive (WF-06)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive (WF-06)": {
+      "main": [
+        [
+          {
+            "node": "Operação final",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Operação final": {
+      "main": [
+        [
+          {
+            "node": "Gravar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gravar": {
+      "main": [
+        [
+          {
+            "node": "Resultado",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "therion-wf-99"
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}

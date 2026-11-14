@@ -1,0 +1,21 @@
+{
+  "name": "therion-fluxo",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Sistema de fluxo de projetos da EJ (fases 1 e 2)",
+  "license": "UNLICENSED",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.js\"",
+    "test:unit": "node --test \"tests/unit/*.test.js\"",
+    "db:up": "docker compose up -d postgres",
+    "migrar": "node scripts/migrar.js",
+    "fluxos": "node scripts/carregar_fluxos.js",
+    "build": "node scripts/build_workflows.js",
+    "simular": "node scripts/simular.js"
+  },
+  "dependencies": {
+    "pg": "^8.13.0",
+    "yaml": "^2.6.0"
+  }
+}

@@ -1,0 +1,1307 @@
+# ESPECIFICAÇÃO TÉCNICA — SISTEMA DE FLUXO DE PROJETOS DA EJ (Therion)
+
+> Documento-fonte para um agente de IA implementar o sistema. Leia inteiro antes de codar.
+> Convenções: MUST = obrigatório; SHOULD = recomendado; MAY = opcional.
+> Idioma do código: identificadores em português snake_case (consistente com o modelo de dados), comentários em português.
+
+---------------------------------------------------------------------------------------------------
+## 0. SUMÁRIO
+1. Objetivo e escopo
+2. Glossário
+3. Decisões de arquitetura
+4. Arquitetura (diagrama e componentes)
+5. Modelo de dados (SQL completo)
+6. Templates de fluxo (máquina de estados configurável)
+7. Fluxo padrão entre diretorias (inclui reprovação, execução, pagamento)
+8. Regras de negócio (permissões, retrocesso, pausa, rodízio, SLA)
+9. Canais de interação e notificação
+10. Identificação e vínculo de usuários
+11. Interface de comandos (bots)
+12. API do endpoint (contrato HTTP)
+13. Integração Google Drive/Docs e Planilha de membros
+14. Geração de documentos com IA (orçamento/contrato) + validação humana
+15. Geração do fluxograma visual
+16. Variáveis de ambiente (feature flags)
+17. Workflows n8n (um por responsabilidade, nó a nó)
+18. Códigos (Code nodes / módulos) e suas responsabilidades
+19. Tratamento de erros, idempotência, concorrência
+20. Segurança, rede (Tailscale + Cloudflare) e LGPD
+21. Backup, observabilidade, dashboard
+22. Continuidade de gestão (rotação anual da EJ)
+23. Estrutura de repositório
+24. Plano de implementação por fases + critérios de aceite
+25. Questões em aberto (decidir antes/durante)
+
+---------------------------------------------------------------------------------------------------
+## 1. OBJETIVO E ESCOPO
+
+Automatizar a comunicação e o acompanhamento de projetos entre as diretorias **Comercial, Projetos,
+Financeiro e Administrativo** de uma Empresa Júnior. Cada projeto percorre um fluxo de etapas; membros
+executam **ações** por um canal de mensagens (Telegram, WhatsApp, E-mail) ou formulário (Google Forms);
+o sistema valida permissão, registra o evento, move o projeto, organiza arquivos no Drive, gera
+documentos com IA (com validação humana) e notifica os responsáveis da próxima etapa.
+
+Tipos de serviço iniciais (catálogo extensível sem alterar código):
+- `impressao_modelagem_3d` — Impressão e/ou Modelagem 3D
+- `website` — Websites
+
+Fora de escopo (v1): portal web completo para clientes; emissão fiscal; integração bancária automática.
+
+---------------------------------------------------------------------------------------------------
+## 2. GLOSSÁRIO
+
+| Termo | Significado |
+|---|---|
+| Projeto | Instância de um serviço para um cliente. É o **grafo**. |
+| Etapa | Estado do projeto no fluxo (nó do grafo). Tem diretoria responsável. |
+| Ação | Evento que move (ou não) o projeto entre etapas (aresta do grafo). Imutável. |
+| Template de fluxo | Definição declarativa de etapas, transições e campos exigidos por tipo de serviço. |
+| Evento | Registro imutável na tabela `acoes` (event sourcing). Estado atual é derivado/projetado. |
+| Diretoria | comercial, projetos, financeiro, administrativo (+ papel especial `presidencia`/`admin`). |
+| Canal | telegram, whatsapp, email, forms. |
+| Responsável atribuído | Pessoa (não só diretoria) designada por rodízio para uma etapa. |
+| Lead | Contato/cliente potencial que originou o projeto. |
+
+---------------------------------------------------------------------------------------------------
+## 3. DECISÕES DE ARQUITETURA (com justificativa)
+
+1. **Orquestração: n8n self-hosted** (Docker). Backend próprio é alternativa menos provável; a lógica
+   de domínio fica isolada em Code nodes/arquivos JS reutilizáveis para permitir migração futura.
+2. **Persistência: PostgreSQL** (mesmo container stack do n8n). Substitui o "arquivo de log por
+   projeto", que é frágil a concorrência e impede consultas agregadas.
+3. **Event sourcing leve**: toda ação é um INSERT em `acoes` (nunca UPDATE/DELETE). A tabela `projetos`
+   é uma projeção (cache do estado atual) atualizada na mesma transação. Retroceder = nova ação do
+   tipo `reverter`. Isso entrega auditoria e "desfazer" gratuitamente.
+   - O "arquivo de logs por projeto" do requisito original é mantido como **exportação**: um
+     `log.jsonl` na pasta do projeto no Drive, regenerado a cada ação (legível por humanos/backup).
+4. **Fluxo configurável**: templates YAML/JSON versionados em `fluxos/` e carregados para a tabela
+   `templates_fluxo`. Novo serviço = novo arquivo, sem código.
+5. **Exposição segura**: n8n escuta só na rede Tailscale; Cloudflare Tunnel expõe apenas os paths de
+   webhook (`/webhook/*`) com WAF; UI do n8n só via Tailscale.
+6. **Membros**: Google Sheets é a fonte de verdade editável pela EJ; sincronizado para a tabela
+   `membros` a cada 15 min (e sob demanda). Validação por requisição consulta o Postgres (rápido).
+7. **Fluxograma visual**: Mermaid → PNG via container `mermaid-cli` (ou Kroki) chamado por HTTP.
+8. **IA**: provedor configurável via env (padrão: Anthropic Claude, modelo `claude-sonnet-5-5`).
+   Documentos gerados SEMPRE como rascunho → validação humana obrigatória.
+
+---------------------------------------------------------------------------------------------------
+## 4. ARQUITETURA
+
+```
+                ┌───────────── Usuários (membros da EJ) ──────────────┐
+                │ Telegram   WhatsApp(Cloud API)   E-mail   G. Forms  │
+                └────┬──────────┬─────────────────┬────────┬──────────┘
+                     │ webhook  │ webhook         │ IMAP   │ Apps Script → webhook
+                     ▼          ▼                 ▼        ▼
+          Cloudflare Tunnel (WAF, só /webhook/*) ──► Tailscale ──► host
+                     │
+              ┌──────▼───────────────────────── n8n ─────────────────────────────┐
+              │ WF-01 Entrada/Normalização ─► WF-02 Identificação/Autorização     │
+              │        ─► WF-03 Roteador de Comandos ─► WF-04 Motor de Fluxo      │
+              │ WF-05 Notificações   WF-06 Drive/Docs   WF-07 IA Documentos       │
+              │ WF-08 Fluxograma     WF-09 Sync Membros WF-10 SLA/Lembretes       │
+              │ WF-11 Backup/Export  WF-12 Relatório    WF-99 Error Handler       │
+              └──────┬────────────────────────┬───────────────────┬──────────────┘
+                     ▼                        ▼                   ▼
+                PostgreSQL           Google Drive/Docs/Sheets   Mermaid renderer / LLM API
+```
+
+Fluxo de uma requisição (resumo):
+`mensagem → normaliza (canal-agnóstico) → identifica membro → interpreta comando → valida
+permissão + transição + campos → transação (INSERT acao, UPDATE projeto, etapa) → efeitos
+(Drive, IA, export log) → notifica responsáveis → responde ao remetente`.
+
+---------------------------------------------------------------------------------------------------
+## 5. MODELO DE DADOS (PostgreSQL)
+
+Hierarquia lógica: Projeto(Etapa(Ação())). Todas as datas em `timestamptz` (ISO 8601, UTC no banco,
+exibidas em America/Sao_Paulo).
+
+```sql
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Diretorias e papéis
+CREATE TYPE diretoria_t AS ENUM ('comercial','projetos','financeiro','administrativo','presidencia');
+CREATE TYPE canal_t     AS ENUM ('telegram','whatsapp','email','forms');
+CREATE TYPE status_projeto_t AS ENUM ('ativo','pausado','concluido','abandonado');
+
+-- Membros (projeção da planilha)
+CREATE TABLE membros (
+  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  nome             text NOT NULL,
+  email            text UNIQUE NOT NULL,
+  telefone_e164    text UNIQUE,            -- +5511999999999 (WhatsApp)
+  telegram_user_id bigint UNIQUE,          -- preenchido no vínculo
+  diretoria        diretoria_t NOT NULL,
+  is_admin         boolean NOT NULL DEFAULT false,  -- pode agir em qualquer etapa
+  ativo            boolean NOT NULL DEFAULT true,   -- false = desligado (offboarding)
+  disponivel       boolean NOT NULL DEFAULT true,   -- false = férias/ausente (sai do rodízio)
+  cargo            text NOT NULL DEFAULT 'membro' CHECK (cargo IN ('membro','diretor')), -- coluna 'cargo' da planilha
+  canal_preferido  canal_t NOT NULL DEFAULT 'email',
+  canais_habilitados canal_t[] NOT NULL DEFAULT '{email}',
+  sincronizado_em  timestamptz
+);
+
+-- Clientes
+CREATE TABLE clientes (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  nome        text NOT NULL,
+  documento   text,               -- CPF/CNPJ (dado pessoal: ver LGPD)
+  email       text,
+  telefone    text,
+  criado_em   timestamptz NOT NULL DEFAULT now()
+);
+
+-- Templates de fluxo versionados (conteúdo = JSON do YAML de fluxos/)
+CREATE TABLE templates_fluxo (
+  tipo_servico text NOT NULL,
+  versao       int  NOT NULL,
+  definicao    jsonb NOT NULL,
+  ativo        boolean NOT NULL DEFAULT true,
+  PRIMARY KEY (tipo_servico, versao)
+);
+
+-- Projeto (projeção do estado atual)
+CREATE TABLE projetos (
+  id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  codigo                text UNIQUE NOT NULL,   -- humano: "P-2026-0042" (usado nos chats)
+  nome                  text NOT NULL,
+  cliente_id            uuid NOT NULL REFERENCES clientes(id),
+  nome_lead             text NOT NULL,
+  tipo                  text NOT NULL,          -- tipo_servico
+  template_versao       int  NOT NULL,          -- projeto fica preso à versão com que nasceu
+  membro_original_id    uuid NOT NULL REFERENCES membros(id),
+  etapa_atual_id        uuid,                   -- FK adicionada abaixo
+  status                status_projeto_t NOT NULL DEFAULT 'ativo',
+  estimativa_horas      numeric,
+  estimativa_filamento_g numeric,
+  valor_orcado          numeric(12,2),
+  valor_contratado      numeric(12,2),
+  link_pasta_drive      text,
+  data_inicio           timestamptz NOT NULL DEFAULT now(),
+  data_final            timestamptz,            -- set quando concluido/abandonado
+  versao                int NOT NULL DEFAULT 0, -- controle de concorrência otimista
+  FOREIGN KEY (tipo, template_versao) REFERENCES templates_fluxo(tipo_servico, versao)
+);
+
+-- Etapa (instância de uma etapa do template dentro de um projeto; uma linha por entrada)
+CREATE TABLE etapas (
+  id                     uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  projeto_id             uuid NOT NULL REFERENCES projetos(id),
+  chave                  text NOT NULL,          -- ex: 'orcamento' (do template)
+  nome                   text NOT NULL,
+  diretoria_responsavel  diretoria_t NOT NULL,
+  responsavel_atribuido_id uuid REFERENCES membros(id),
+  data_entrada           timestamptz NOT NULL DEFAULT now(),
+  data_saida             timestamptz,
+  prazo_sla              timestamptz            -- data_entrada + sla_horas
+);
+ALTER TABLE projetos ADD CONSTRAINT fk_etapa_atual FOREIGN KEY (etapa_atual_id) REFERENCES etapas(id);
+
+-- Ação (EVENTO IMUTÁVEL; aresta do grafo)
+CREATE TABLE acoes (
+  id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  projeto_id        uuid NOT NULL REFERENCES projetos(id),
+  seq               int  NOT NULL,              -- 1,2,3... por projeto
+  tipo_acao         text NOT NULL,              -- ver §6 (ex: 'enviar_escopo','reverter','pausar')
+  etapa_origem_id   uuid REFERENCES etapas(id),
+  etapa_destino_id  uuid REFERENCES etapas(id), -- null se não muda de etapa
+  status_anterior   status_projeto_t NOT NULL,
+  status_novo       status_projeto_t NOT NULL,
+  membro_id         uuid NOT NULL REFERENCES membros(id),
+  nome_responsavel  text NOT NULL,              -- desnormalizado p/ auditoria
+  canal_origem      canal_t NOT NULL,
+  dados             jsonb NOT NULL DEFAULT '{}',-- campos exigidos pelo template
+  observacoes       text,
+  arquivos          jsonb NOT NULL DEFAULT '[]',-- [{drive_file_id, nome, url, mime}]
+  revertida_por_id  uuid REFERENCES acoes(id),  -- único UPDATE permitido (marcação)
+  reverte_acao_id   uuid REFERENCES acoes(id),  -- preenchido em ações 'reverter'
+  idempotency_key   text UNIQUE NOT NULL,       -- ver §19
+  criado_em         timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (projeto_id, seq)
+);
+
+-- Documentos gerados por IA aguardando validação
+CREATE TABLE documentos (
+  id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  projeto_id    uuid NOT NULL REFERENCES projetos(id),
+  tipo          text NOT NULL CHECK (tipo IN ('orcamento','contrato')),
+  versao        int  NOT NULL,
+  status        text NOT NULL CHECK (status IN ('rascunho','aprovado','reprovado','enviado_cliente')),
+  drive_doc_id  text NOT NULL,
+  gerado_por    text NOT NULL,                 -- 'ia:<modelo>' ou membro
+  validado_por_id uuid REFERENCES membros(id),
+  motivo_reprovacao text,
+  criado_em     timestamptz NOT NULL DEFAULT now()
+);
+
+-- Estado do rodízio por diretoria/etapa
+CREATE TABLE rodizio (
+  chave_etapa   text NOT NULL,
+  diretoria     diretoria_t NOT NULL,
+  ultimo_membro_id uuid REFERENCES membros(id),
+  PRIMARY KEY (chave_etapa, diretoria)
+);
+
+-- Códigos de vínculo de canal
+CREATE TABLE vinculos_pendentes (
+  codigo      text PRIMARY KEY,                -- 6 dígitos
+  membro_id   uuid NOT NULL REFERENCES membros(id),
+  canal       canal_t NOT NULL,
+  expira_em   timestamptz NOT NULL
+);
+
+-- Sessões de conversa (para menus/diálogos multi-passo nos bots)
+CREATE TABLE sessoes_chat (
+  canal       canal_t NOT NULL,
+  id_externo  text NOT NULL,
+  estado      jsonb NOT NULL,
+  expira_em   timestamptz NOT NULL,
+  PRIMARY KEY (canal, id_externo)
+);
+
+-- Notificações (outbox p/ reenvio)
+CREATE TABLE notificacoes (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  membro_id   uuid REFERENCES membros(id),
+  canal       canal_t NOT NULL,
+  payload     jsonb NOT NULL,
+  status      text NOT NULL DEFAULT 'pendente' CHECK (status IN ('pendente','enviada','falhou')),
+  tentativas  int NOT NULL DEFAULT 0,
+  erro        text,
+  criado_em   timestamptz NOT NULL DEFAULT now(),
+  enviada_em  timestamptz
+);
+
+-- Proteção: acoes são append-only
+CREATE OR REPLACE FUNCTION bloquear_alteracao_acoes() RETURNS trigger AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'acoes é append-only'; END IF;
+  -- UPDATE: só permite preencher revertida_por_id (uma vez); qualquer outra mudança é bloqueada
+  IF OLD.revertida_por_id IS NOT NULL
+     OR (to_jsonb(NEW) - 'revertida_por_id') IS DISTINCT FROM (to_jsonb(OLD) - 'revertida_por_id') THEN
+    RAISE EXCEPTION 'apenas revertida_por_id pode ser preenchido, uma única vez';
+  END IF;
+  RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+-- Idempotência de requisições (inclusive consultas que não geram ação)
+CREATE TABLE requisicoes_processadas (
+  idempotency_key text PRIMARY KEY,
+  resposta        jsonb NOT NULL,
+  criado_em       timestamptz NOT NULL DEFAULT now()
+);
+CREATE TRIGGER trg_acoes_append_only BEFORE UPDATE OR DELETE ON acoes
+  FOR EACH ROW EXECUTE FUNCTION bloquear_alteracao_acoes();
+
+CREATE INDEX ON acoes (projeto_id, seq);
+CREATE INDEX ON projetos (status, etapa_atual_id);
+CREATE INDEX ON etapas (projeto_id, data_saida);
+```
+
+Observações sobre o modelo original corrigidas:
+- `status` saiu da Ação e foi para o Projeto; a Ação registra `status_anterior → status_novo`.
+- ID da Ação era descrito como "ID da etapa" (erro) → corrigido.
+- Ação ganhou `criado_em`, `etapa_origem_id`, `etapa_destino_id` (definem a aresta).
+- Etapa ganhou `data_saida`, `responsavel_atribuido_id`, `prazo_sla`.
+- Projeto ganhou cliente, valores, estimativas, link da pasta, código legível e `versao`.
+
+---------------------------------------------------------------------------------------------------
+## 6. TEMPLATES DE FLUXO (máquina de estados configurável)
+
+Arquivo por serviço em `fluxos/<tipo_servico>.yaml`. Carregado por script `scripts/carregar_fluxos.js`
+(valida com JSON Schema `fluxos/schema.json` e insere nova versão em `templates_fluxo`).
+
+Formato:
+```yaml
+tipo_servico: website
+nome_exibicao: "Websites"
+versao: 1
+etapa_inicial: registro_lead
+etapas:
+  <chave>:
+    nome: "Nome legível"
+    diretoria: comercial|projetos|financeiro|administrativo
+    sla_horas: 48                # para lembretes (§8.6)
+    rodizio: true|false          # atribuir pessoa automaticamente (§8.5)
+    terminal: false              # etapas finais
+    status_projeto: concluido    # (só em terminais) status a aplicar
+transicoes:
+  - acao: <tipo_acao>
+    de: <chave_etapa>
+    para: <chave_etapa>
+    rotulo: "Texto do botão"
+    campos:                      # validados no motor
+      - { nome: estimativa_horas, tipo: number, obrigatorio: true, min: 0 }
+      - { nome: arquivo_escopo, tipo: arquivo, obrigatorio: false }
+    efeitos: [gerar_orcamento_ia, criar_pasta_drive, ...]   # ver §18 "efeitos"
+```
+
+Ações globais (valem para qualquer etapa não-terminal, definidas no motor, não no YAML):
+- `pausar` (status ativo→pausado; campo obrigatório `motivo`)
+- `retomar` (pausado→ativo)
+- `abandonar` (→abandonado; campo obrigatório `motivo`; define data_final; vai a etapa terminal `abandonado`)
+- `reverter` (desfaz a última ação não revertida; §8.3)
+- `comentar` (não muda etapa; só registra observação/arquivo)
+- `reatribuir` (troca responsável atribuído da etapa atual; só admin ou diretor da diretoria)
+
+### 6.1 Template `website` (v1) — completo
+```yaml
+tipo_servico: website
+nome_exibicao: "Websites"
+versao: 1
+etapa_inicial: registro_lead
+etapas:
+  registro_lead:        { nome: "Registro do lead",          diretoria: comercial,      sla_horas: 24,  rodizio: false }
+  definicao_escopo:     { nome: "Definição de escopo",       diretoria: projetos,       sla_horas: 72,  rodizio: true }
+  elaboracao_orcamento: { nome: "Elaboração do orçamento",   diretoria: financeiro,     sla_horas: 48,  rodizio: true }
+  validacao_orcamento:  { nome: "Validação do orçamento",    diretoria: financeiro,     sla_horas: 24,  rodizio: false }
+  aguardando_cliente_orcamento: { nome: "Aguardando resposta do cliente", diretoria: comercial, sla_horas: 120, rodizio: false }
+  negociacao:           { nome: "Negociação/contraproposta", diretoria: comercial,      sla_horas: 72,  rodizio: false }
+  elaboracao_contrato:  { nome: "Elaboração do contrato",    diretoria: administrativo, sla_horas: 48,  rodizio: true }
+  validacao_contrato:   { nome: "Validação do contrato",     diretoria: administrativo, sla_horas: 24,  rodizio: false }
+  aguardando_assinatura:{ nome: "Aguardando assinatura",     diretoria: administrativo, sla_horas: 120, rodizio: false }
+  execucao:             { nome: "Execução",                  diretoria: projetos,       sla_horas: 720, rodizio: false }
+  entrega:              { nome: "Entrega e aceite do cliente", diretoria: projetos,     sla_horas: 120, rodizio: false }
+  pagamento:            { nome: "Pagamento",                 diretoria: financeiro,     sla_horas: 240, rodizio: false }
+  concluido:            { nome: "Concluído",  diretoria: administrativo, terminal: true, status_projeto: concluido }
+  abandonado:           { nome: "Abandonado", diretoria: comercial,      terminal: true, status_projeto: abandonado }
+transicoes:
+  - acao: enviar_para_escopo
+    de: registro_lead
+    para: definicao_escopo
+    rotulo: "Enviar para Projetos"
+    campos:
+      - { nome: descricao_demanda, tipo: text, obrigatorio: true }
+      - { nome: prazo_desejado,    tipo: date, obrigatorio: false }
+  - acao: enviar_escopo
+    de: definicao_escopo
+    para: elaboracao_orcamento
+    rotulo: "Escopo definido"
+    campos:
+      - { nome: escopo,           tipo: text,   obrigatorio: true }
+      - { nome: estimativa_horas, tipo: number, obrigatorio: true, min: 1 }
+      - { nome: arquivo_escopo,   tipo: arquivo, obrigatorio: false }
+    efeitos: [gerar_orcamento_ia]          # IA cria rascunho e já leva à validação
+  - acao: orcamento_rascunho_pronto       # disparada pelo sistema (WF-07) ou manualmente com arquivo
+    de: elaboracao_orcamento
+    para: validacao_orcamento
+    campos:
+      - { nome: documento_id, tipo: text, obrigatorio: true }
+  - acao: aprovar_orcamento_interno
+    de: validacao_orcamento
+    para: aguardando_cliente_orcamento
+    rotulo: "Aprovar e enviar ao cliente"
+    campos:
+      - { nome: valor_orcado, tipo: money, obrigatorio: true }
+    efeitos: [marcar_documento_aprovado, exportar_pdf_orcamento, enviar_documento_cliente]  # último = no-op na v1 (§14.2)
+  - acao: reprovar_orcamento_interno
+    de: validacao_orcamento
+    para: elaboracao_orcamento
+    rotulo: "Pedir correção"
+    campos:
+      - { nome: motivo, tipo: text, obrigatorio: true }
+    efeitos: [marcar_documento_reprovado, gerar_orcamento_ia]   # regenera com o motivo como instrução
+  - acao: cliente_aprovou
+    de: aguardando_cliente_orcamento
+    para: elaboracao_contrato
+    rotulo: "Cliente aprovou"
+    campos:
+      - { nome: comprovante_aprovacao, tipo: arquivo, obrigatorio: false }
+    efeitos: [gerar_contrato_ia]
+  - acao: cliente_contraproposta
+    de: aguardando_cliente_orcamento
+    para: negociacao
+    rotulo: "Cliente fez contraproposta"
+    campos:
+      - { nome: detalhes_contraproposta, tipo: text, obrigatorio: true }
+  - acao: renegociar_escopo
+    de: negociacao
+    para: definicao_escopo
+    rotulo: "Revisar escopo"
+  - acao: renegociar_valor
+    de: negociacao
+    para: elaboracao_orcamento
+    rotulo: "Revisar valor"
+    efeitos: [gerar_orcamento_ia]
+  - acao: cliente_recusou
+    de: [aguardando_cliente_orcamento, negociacao]
+    para: abandonado
+    rotulo: "Cliente recusou"
+    campos:
+      - { nome: motivo, tipo: text, obrigatorio: true }
+  - acao: contrato_rascunho_pronto
+    de: elaboracao_contrato
+    para: validacao_contrato
+    campos:
+      - { nome: documento_id, tipo: text, obrigatorio: true }
+  - acao: aprovar_contrato_interno
+    de: validacao_contrato
+    para: aguardando_assinatura
+    rotulo: "Aprovar e enviar ao cliente"
+    efeitos: [marcar_documento_aprovado, exportar_pdf_contrato, enviar_documento_cliente]   # último = no-op na v1 (§14.2)
+  - acao: reprovar_contrato_interno
+    de: validacao_contrato
+    para: elaboracao_contrato
+    campos:
+      - { nome: motivo, tipo: text, obrigatorio: true }
+    efeitos: [marcar_documento_reprovado, gerar_contrato_ia]
+  - acao: contrato_assinado
+    de: aguardando_assinatura
+    para: execucao
+    rotulo: "Contrato assinado"
+    campos:
+      - { nome: contrato_assinado, tipo: arquivo, obrigatorio: true }
+      - { nome: valor_contratado,  tipo: money,   obrigatorio: true }
+  - acao: concluir_execucao
+    de: execucao
+    para: entrega
+    campos:
+      - { nome: link_entrega, tipo: text, obrigatorio: true }
+  - acao: ajustes_solicitados
+    de: entrega
+    para: execucao
+    campos:
+      - { nome: ajustes, tipo: text, obrigatorio: true }
+  - acao: cliente_aceitou_entrega
+    de: entrega
+    para: pagamento
+    campos:
+      - { nome: termo_aceite, tipo: arquivo, obrigatorio: false }
+  # Padrão da EJ: pagamento à vista (1 parcela). O self-loop abaixo existe só para casos excepcionais;
+  # nenhuma outra parte do sistema depende de parcelamento.
+  - acao: registrar_parcela
+    de: pagamento
+    para: pagamento            # self-loop: registra cada parcela
+    campos:
+      - { nome: valor_pago, tipo: money, obrigatorio: true }
+      - { nome: comprovante, tipo: arquivo, obrigatorio: true }
+  - acao: quitar
+    de: pagamento
+    para: concluido
+    rotulo: "Pagamento quitado"
+    guarda: "soma(registrar_parcela.valor_pago) >= projeto.valor_contratado"
+```
+
+### 6.2 Template `impressao_modelagem_3d` (v1)
+Idêntico ao `website`, com as diferenças:
+- `enviar_escopo.campos`: `escopo` (text, obr.), `estimativa_horas_modelagem` (number, opcional),
+  `estimativa_filamento_g` (number, obr.), `material` (enum: PLA|PETG|ABS|TPU|resina, obr.),
+  `arquivo_modelo` (arquivo .stl/.3mf/.step, opcional).
+- `execucao` renomeada "Modelagem/Impressão", `sla_horas: 240`.
+- `concluir_execucao.campos`: `fotos_peca` (arquivo, obr.), `filamento_real_g` (number, obr.).
+- `entrega` aceita `forma_entrega` (enum: retirada|correio).
+
+### 6.3 Como adicionar um serviço
+1. Copiar um YAML de `fluxos/`, alterar `tipo_servico`, etapas, campos.
+2. `node scripts/carregar_fluxos.js` (valida e cria versão).
+3. Adicionar templates de prompt de IA em `prompts/<tipo_servico>/{orcamento,contrato}.md` (opcional;
+   cai no genérico).
+Projetos existentes continuam na versão de template com que nasceram.
+
+---------------------------------------------------------------------------------------------------
+## 7. FLUXO PADRÃO ENTRE DIRETORIAS (visão de negócio)
+
+```mermaid
+flowchart LR
+  A[Comercial: registro do lead] --> B[Projetos: escopo + estimativa]
+  B --> C[Financeiro: orçamento IA] --> C2{Financeiro valida}
+  C2 -- reprova --> C
+  C2 -- aprova --> D{Cliente}
+  D -- aprova --> E[Administrativo: contrato IA] --> E2{Adm valida}
+  E2 -- reprova --> E
+  E2 -- aprova --> F[Assinatura]
+  D -- contraproposta --> N[Comercial: negociação]
+  N --> B
+  N --> C
+  D -- recusa --> X[Abandonado]
+  N -- recusa --> X
+  F --> G[Projetos: execução] --> H{Entrega/aceite}
+  H -- ajustes --> G
+  H -- aceite --> P[Financeiro: pagamento] --> Z[Concluído]
+```
+
+---------------------------------------------------------------------------------------------------
+## 8. REGRAS DE NEGÓCIO
+
+### 8.1 Autorização (MUST, verificada no WF-02 e de novo no motor, dentro da transação)
+Um membro M pode executar ação A no projeto P se TODAS:
+1. M.ativo = true.
+2. P.status = 'ativo' (exceto `retomar`, que exige 'pausado'; e `comentar`, permitido em qualquer status não-terminal).
+3. A é transição válida a partir da etapa atual no template do projeto, ou é ação global.
+4. Diretoria: M.diretoria == etapa_atual.diretoria_responsavel **OU** M.is_admin **OU**
+   M.diretoria == 'presidencia'.
+5. Se `env.EXIGIR_RESPONSAVEL_ATRIBUIDO=true` e a etapa tem responsável atribuído: M deve ser esse
+   responsável, ou diretor/admin.
+6. Regras específicas das globais:
+   - `pausar`/`retomar`/`abandonar`: diretoria responsável da etapa atual, comercial, ou admin.
+   - `reverter`: autor da ação revertida (até `JANELA_REVERSAO_HORAS`) OU admin.
+   - `reatribuir`: admin ou membro da diretoria responsável.
+   - Criar projeto: diretoria comercial ou admin.
+Negação → resposta clara ao usuário dizendo QUEM pode agir (diretoria e responsável atribuído).
+
+### 8.2 Validação de campos
+Para cada campo do template: obrigatoriedade, tipo (text, number, money, date, enum, arquivo),
+min/max, extensões permitidas para arquivo (`ARQUIVO_EXTENSOES_PERMITIDAS`), tamanho
+(`ARQUIVO_TAMANHO_MAX_MB`). Campos ausentes → bot entra em modo diálogo pedindo um a um (§11.3).
+
+### 8.3 Retrocesso (reverter)
+- Nunca apaga. Cria ação `reverter` com `reverte_acao_id = X` e marca `X.revertida_por_id`.
+- Alvo padrão: última ação não-revertida que mudou etapa ou status. `reverter <seq>` permitido só
+  para a última (reverter em cadeia = chamar várias vezes, sempre do fim). Isso mantém consistência.
+- Efeito: nova entrada em `etapas` igual à etapa de origem de X (nova `data_entrada`), status volta
+  a `X.status_anterior`, campos projetados no projeto (valores, estimativas) recalculados por replay
+  dos eventos não revertidos (função `projetar_estado`).
+- Efeitos externos NÃO são desfeitos automaticamente (arquivos no Drive ficam; documentos ficam
+  marcados como `reprovado` com motivo "revertido"). Notificar quem estava na etapa desfeita.
+- Proibido reverter a partir de etapa terminal, exceto admin (reabrir projeto: limpa data_final).
+
+### 8.4 Pausa e abandono
+- `pausar`: status→pausado, etapa não muda, SLA congela (lembretes param). Motivo obrigatório.
+- `retomar`: status→ativo, `prazo_sla` recalculado somando o tempo pausado.
+- `abandonar`: motivo obrigatório, vai para etapa terminal `abandonado`, define `data_final`.
+- Projeto em `aguardando_*` sem resposta por `DIAS_AUTO_ABANDONO` → sistema SUGERE abandono ao
+  comercial (nunca abandona sozinho).
+
+### 8.5 Rodízio de responsáveis
+Etapas com `rodizio: true` recebem `responsavel_atribuido_id` ao entrar:
+- Estratégia (DECIDIDA): **round robin sobre lista em ordem alfabética por `nome`** (collation pt-BR,
+  sem acento/caixa) dos membros ativos+disponíveis da diretoria. Próximo = primeiro nome
+  alfabeticamente MAIOR que o de `rodizio.ultimo_membro_id`; se não houver, volta ao início da lista.
+  (Comparar por nome, não por posição, para que entradas/saídas de membros não bagunçem a ordem.)
+- Membros com `disponivel=false` ou `ativo=false` são pulados. Se ninguém disponível → atribui nulo
+  e notifica todos da diretoria + admins.
+- Em reversão para uma etapa, reatribui à MESMA pessoa que tinha antes (continuidade), se disponível.
+- `reatribuir` manual sobrescreve.
+- Atualização de `rodizio` dentro da transação com `SELECT ... FOR UPDATE`.
+
+### 8.6 SLA e lembretes (WF-10, a cada hora)
+- Etapa aberta, projeto ativo, `now() > prazo_sla` → lembrete ao responsável (ou diretoria).
+- Repetir a cada `LEMBRETE_INTERVALO_HORAS`. Após `ESCALONAR_APOS_LEMBRETES` lembretes → notifica
+  diretor da diretoria/admins.
+- Silenciar fora de `HORARIO_NOTIFICACAO_INICIO`–`FIM` e fins de semana (configurável).
+
+### 8.7 Criação de projeto
+Comercial envia: `nome_projeto`, `tipo` (lista de templates ativos), `cliente_nome`, `cliente_contato`
+(email/telefone), `nome_lead`, `descricao` (opcional). Sistema: cria cliente (ou reaproveita por
+email/doc), gera `codigo` `P-<ano>-<seq 4 dígitos>`, cria pasta no Drive, cria etapa inicial, ação
+`criar_projeto` (seq 1), notifica.
+
+---------------------------------------------------------------------------------------------------
+## 9. CANAIS DE INTERAÇÃO E NOTIFICAÇÃO
+
+| Canal | Entrada (interação) | Saída (notificação) | Observação |
+|---|---|---|---|
+| Telegram | Bot API webhook; comandos + inline keyboard | sendMessage/sendDocument/sendPhoto | Canal recomendado (grátis, botões ricos). |
+| WhatsApp | **WhatsApp Cloud API (Meta) oficial** webhook | Templates aprovados fora da janela de 24h | Custo por conversa e verificação de negócio. APIs não-oficiais (Baileys/Evolution) SOMENTE se `WHATSAPP_PROVIDER=evolution`, cientes do risco de banimento. |
+| E-mail | IMAP polling (n8n Email Trigger) em caixa dedicada; assunto com `[P-2026-0042]` + comando no corpo | SMTP | Anexos viram arquivos da ação. Responder ao e-mail de notificação = agir. |
+| Google Forms | Apps Script `onFormSubmit` → POST webhook assinado (HMAC) | NÃO serve para notificação | Útil para criação de projeto e ações com muitos campos. Um form por tipo de ação comum. Identificação pelo e-mail coletado do Google (exigir login). |
+
+Preferência por usuário: `membros.canal_preferido` (notificações) e `canais_habilitados`
+(de onde ele pode interagir). Alterável via comando `/canal` ou na planilha.
+Cada canal é ligado/desligado por env (§16). Se o canal preferido estiver desligado/falhar → fallback
+para e-mail.
+
+Conteúdo padrão de notificação:
+```
+🔔 [P-2026-0042] Site Padaria Sol
+Etapa: Elaboração do orçamento (Financeiro)
+Responsável: Ana Souza
+Ação anterior: "Escopo definido" por João (Projetos) — 12/11 14:03
+Obs: cliente quer entrega até março
+Prazo: 14/11 14:03
+[Ver detalhes] [Fluxograma] [Ações disponíveis]
+```
+
+---------------------------------------------------------------------------------------------------
+## 10. IDENTIFICAÇÃO E VÍNCULO DE USUÁRIOS
+
+Fonte: planilha "Membros EJ" (Google Sheets), colunas obrigatórias:
+`nome | email | telefone | diretoria | cargo | is_admin | ativo | disponivel | canal_preferido | canais_habilitados`
+(`cargo` já existe na planilha: valores `membro` | `diretor`. Diretores recebem escalonamentos de SLA
+(§8.6), podem `reatribuir` e editar preços se forem do Financeiro (§14.1).)
+
+Resolução por canal (WF-02):
+- E-mail: `remetente == membros.email` (case-insensitive). Validar SPF/DKIM se disponível (cabeçalho
+  `Authentication-Results`); senão, aceitar só para ações não críticas (configurável).
+- WhatsApp: `from` (E.164) == `telefone_e164`.
+- Telegram: `from.id == telegram_user_id`. Se não vinculado → fluxo de vínculo:
+  1. Usuário envia `/vincular email@ej.com`.
+  2. Sistema gera código de 6 dígitos (expira em 10 min), envia para o e-mail do membro.
+  3. Usuário envia `/codigo 123456` → grava `telegram_user_id`.
+- Forms: e-mail autenticado do Google.
+Não identificado → resposta genérica ("Usuário não cadastrado, fale com a diretoria") e log; rate
+limit por id externo.
+
+Onboarding: adicionar linha na planilha → sync → membro recebe e-mail de boas-vindas com instruções.
+Offboarding: `ativo=false` na planilha → sync remove do rodízio; etapas atribuídas a ele são
+reatribuídas automaticamente e admins notificados.
+
+---------------------------------------------------------------------------------------------------
+## 11. INTERFACE DE COMANDOS (bots)
+
+### 11.1 Comandos (Telegram com `/`; WhatsApp/E-mail aceitam sem barra; case-insensitive)
+| Comando | Descrição |
+|---|---|
+| `/ajuda` | Lista comandos. |
+| `/meus` | Projetos onde o usuário (ou sua diretoria) precisa agir agora. |
+| `/projetos [filtro]` | Lista projetos ativos (filtro: etapa, tipo, diretoria). |
+| `/projeto P-2026-0042` | Detalhes + ações disponíveis para o usuário (botões). |
+| `/novo` | Inicia criação de projeto (diálogo). |
+| `/acao P-2026-0042 <tipo_acao> [campo=valor ...]` | Executa ação diretamente. |
+| `/historico P-2026-0042` | Lista de ações (seq, data, autor, tipo, revertida?). |
+| `/fluxograma P-2026-0042` | Imagem do fluxo com estado atual. |
+| `/reverter P-2026-0042` | Reverte última ação (pede confirmação). |
+| `/pausar`, `/retomar`, `/abandonar` `P-...` | Ações globais. |
+| `/canal telegram|whatsapp|email` | Define canal preferido de notificação. |
+| `/ausente` / `/disponivel` | Sai/entra do rodízio. |
+| `/precos`, `/preco <chave> <valor>`, `/simular ...` | Consulta/edição da tabela de preços (§14.1). |
+| `/vincular`, `/codigo` | Vínculo de conta (§10). |
+| `/cancelar` | Cancela diálogo em andamento. |
+
+### 11.2 Seleção de projeto
+Se o usuário omitir o código e tiver só 1 projeto pendente → usa ele; se vários → menu numerado/botões.
+
+### 11.3 Diálogo multi-passo
+Estado em `sessoes_chat` (expira em `SESSAO_TTL_MIN`). O motor devolve "campos faltantes"; o bot
+pergunta um por vez, valida, e ao final mostra RESUMO + botão "Confirmar". Arquivos enviados durante o
+diálogo são associados ao campo do tipo `arquivo` pendente.
+
+### 11.4 Linguagem natural (MAY; `FEATURE_NLU=true`)
+Mensagem livre → LLM com schema (tool use) extrai `{projeto_codigo, tipo_acao, campos}` restrito às
+ações disponíveis para o usuário. SEMPRE exige confirmação com resumo antes de executar.
+
+---------------------------------------------------------------------------------------------------
+## 12. API DO ENDPOINT (contrato HTTP interno)
+
+Todos os canais convertem para um **Comando Normalizado** e chamam o roteador. Também exposto como
+webhook para integrações futuras (`POST /webhook/api/v1/comando`, autenticado com HMAC
+`X-Signature: sha256=<hex>` usando `API_HMAC_SECRET`).
+
+Comando Normalizado (entrada):
+```json
+{
+  "idempotency_key": "telegram:update:123456789",
+  "canal": "telegram",
+  "id_externo_remetente": "987654321",
+  "recebido_em": "2026-11-13T14:03:00Z",
+  "texto": "/acao P-2026-0042 enviar_escopo estimativa_horas=40",
+  "comando": "acao",
+  "args": { "projeto_codigo": "P-2026-0042", "tipo_acao": "enviar_escopo",
+            "campos": { "estimativa_horas": 40 } },
+  "arquivos": [ { "origem": "telegram", "file_id": "AgAC...", "nome": "escopo.pdf", "mime": "application/pdf", "tamanho": 120034 } ],
+  "callback": { "tipo": "botao", "dados": "acao:P-2026-0042:enviar_escopo" }
+}
+```
+
+Resposta (saída, renderizada por canal):
+```json
+{
+  "ok": true,
+  "codigo": "ACAO_REGISTRADA",          // ou NAO_AUTORIZADO, TRANSICAO_INVALIDA, CAMPOS_FALTANTES, CONFLITO, ERRO_INTERNO, NAO_IDENTIFICADO
+  "mensagem": "Ação registrada. Projeto seguiu para Elaboração do orçamento (Financeiro).",
+  "campos_faltantes": [],
+  "botoes": [ { "rotulo": "Ver fluxograma", "dados": "fluxo:P-2026-0042" } ],
+  "anexos": [],
+  "projeto": { "codigo": "P-2026-0042", "etapa": "elaboracao_orcamento", "status": "ativo" }
+}
+```
+
+Endpoints auxiliares (todos via n8n Webhook):
+- `POST /webhook/telegram` — Telegram (valida `X-Telegram-Bot-Api-Secret-Token`).
+- `GET|POST /webhook/whatsapp` — verificação (hub.challenge) e mensagens (valida `X-Hub-Signature-256`).
+- `POST /webhook/forms` — Apps Script (HMAC).
+- `GET /webhook/health` — liveness (sem dados).
+
+---------------------------------------------------------------------------------------------------
+## 13. GOOGLE DRIVE / DOCS / PLANILHA
+
+Auth: Service Account com acesso a um **Shared Drive** da EJ (evita arquivos em conta pessoal que
+some na troca de gestão). Credenciais no n8n.
+
+Estrutura de pastas:
+```
+EJ Projetos/
+  _templates/            (modelos Google Docs de orçamento e contrato, com placeholders {{campo}})
+  _exports/              (backups)
+  2026/
+    P-2026-0042 - Site Padaria Sol/
+      01_comercial/
+      02_escopo/
+      03_orcamento/
+      04_contrato/
+      05_execucao/
+      06_entrega/
+      07_financeiro/
+      log.jsonl          (export do histórico; regenerado a cada ação)
+      fluxograma.png     (último gerado)
+```
+Mapeamento etapa→subpasta definido no template (`pasta: 03_orcamento`) com padrão pela diretoria.
+
+Operações (WF-06): `criar_pasta_projeto`, `upload_arquivo(etapa)`, `mover_arquivo`, `remover_arquivo`
+(move para `_lixeira/` do projeto; remoção definitiva só admin), `copiar_template_doc`,
+`substituir_placeholders`, `exportar_pdf`, `regenerar_log`.
+Arquivos recebidos dos canais: baixar do provedor → enviar ao Drive → guardar `drive_file_id` em
+`acoes.arquivos`. Nomear `<seq>_<tipo_acao>_<nome_original>`.
+
+Planilha de membros: somente leitura pelo sistema, exceto colunas `telegram_user_id` e
+`canal_preferido`, que o sistema escreve de volta (para não perder dados num reset do banco).
+
+---------------------------------------------------------------------------------------------------
+## 14. IA PARA ORÇAMENTOS E CONTRATOS (WF-07)
+
+Gatilho: efeitos `gerar_orcamento_ia` / `gerar_contrato_ia` (se `FEATURE_IA_DOCUMENTOS=true`; senão
+notifica humano para criar manualmente e anexar).
+
+Passos:
+1. Montar contexto: dados do projeto, cliente, escopo, estimativas, histórico relevante, motivo da
+   última reprovação (se houver), tabela de preços (tabela `precos`, sincronizada da planilha do
+   Financeiro — §14.1).
+2. **Cálculo de valores é determinístico em código** (Code node `calcular_orcamento`), NÃO pela IA.
+   A IA só redige texto (descrição do escopo, cronograma, cláusulas específicas).
+3. Chamar LLM com prompt de `prompts/<tipo>/<doc>.md` (ou `prompts/generico/`), saída JSON
+   estruturada `{secoes: {descricao_escopo, entregaveis[], cronograma[], clausulas_especificas[]}}`.
+4. Copiar template Google Docs (`_templates/orcamento_<tipo>`), substituir placeholders com valores
+   calculados + texto da IA. Contrato usa template jurídico fixo revisado; IA só preenche anexos de
+   escopo — cláusulas gerais NUNCA são geradas pela IA.
+5. Inserir `documentos` (status rascunho, versão N+1). Disparar ação de sistema
+   `orcamento_rascunho_pronto` / `contrato_rascunho_pronto` (membro_id = usuário-sistema "Therion Bot").
+6. Notificar responsável da validação com link do Doc + botões Aprovar / Pedir correção.
+7. Aprovado → exportar PDF, `status=aprovado`. **Envio ao cliente é MANUAL na v1** (DECIDIDO): o bot
+   entrega o PDF ao responsável, que envia ao cliente e registra a ação (`cliente_aprovou` etc.).
+   O envio automático virá no futuro; deixar o ponto de extensão pronto (ver §14.2).
+8. Reprovado → motivo vira instrução adicional na regeneração. Após `IA_MAX_REGENERACOES` falhas,
+   desliga IA para aquele documento e pede elaboração manual.
+### 14.1 Tabela de preços (planilha do Financeiro + configuração pelo canal)
+- Fonte de verdade: planilha Google da diretoria Financeira (`SHEETS_PRECOS_ID`, aba `SHEETS_PRECOS_ABA`),
+  colunas: `chave | descricao | valor | unidade | tipo_servico | atualizado_por | atualizado_em`.
+  Chaves esperadas (mínimo): `valor_hora_website`, `valor_hora_modelagem`, `filamento_pla_g`,
+  `filamento_petg_g`, `filamento_abs_g`, `filamento_tpu_g`, `resina_ml`, `margem_percentual`,
+  `impostos_percentual`, `parcelas_padrao` (padrão 1 = à vista), `arredondamento` (ex.: 10).
+- Tabela espelho no banco:
+  ```sql
+  CREATE TABLE precos (
+    chave text PRIMARY KEY, descricao text, valor numeric NOT NULL, unidade text,
+    tipo_servico text, atualizado_por text, atualizado_em timestamptz NOT NULL DEFAULT now()
+  );
+  ALTER TABLE documentos ADD COLUMN precos_snapshot jsonb;
+  ```
+- Sync: WF-09b (mesmo cron do sync de membros + comando `/sync precos`). Linha inválida (valor não
+  numérico, chave desconhecida) → ignorada e reportada ao diretor do Financeiro; valor anterior mantido.
+- O orçamento gerado grava um **snapshot** dos preços usados em `documentos.precos_snapshot`, para que
+  alterações futuras não mudem orçamentos já emitidos.
+- Configuração pelo canal de interação (Telegram/e-mail):
+  | Comando | Quem | Efeito |
+  |---|---|---|
+  | `/precos` | qualquer membro | Lista chaves, valores e última atualização. |
+  | `/preco <chave> <valor>` | Financeiro (`cargo=diretor`) ou admin | Valida, pede confirmação, escreve na PLANILHA (fonte de verdade) e no banco; registra quem/quando; notifica o diretor do Financeiro. |
+  | `/simular <tipo> horas=40` ou `filamento_g=200 material=PLA` | qualquer membro | Mostra o cálculo de `calcularOrcamento` sem criar nada. |
+- Feature flag: `FEATURE_EDITAR_PRECOS_CANAL`.
+
+### 14.2 Pontos de extensão para envio automático ao cliente (futuro)
+- Efeito `enviar_documento_cliente` já declarado nos templates YAML após `aprovar_*_interno`, mas
+  tratado como **no-op que apenas registra** enquanto a flag `ENVIO_AUTOMATICO_CLIENTE` for false.
+- Criar `lib/envio_cliente.js` com interface `enviarDocumentoCliente({projeto, cliente, documento, canal})`
+  retornando `{ok:false, motivo:'NAO_IMPLEMENTADO'}` na v1, e um subworkflow `WF-13 Envio ao Cliente`
+  (Trigger → IF flag → Stop) para ser completado depois.
+- Marcar todo ponto relacionado com o comentário padronizado
+  `// TODO(ENVIO_AUTOMATICO_CLIENTE): <o que falta>` (encontrável com `grep -rn "TODO(ENVIO_AUTOMATICO_CLIENTE"`).
+- Idem para assinatura eletrônica: `// TODO(ASSINATURA_ELETRONICA): ...` em `contrato_assinado`
+  (hoje o PDF assinado é enviado manualmente como arquivo da ação).
+
+### 14.3 Templates de documentos
+Modelos oficiais de orçamento e contrato já existem no **Google Docs** da EJ. IDs via env
+`DOCS_TEMPLATE_ORCAMENTO_<TIPO>` / `DOCS_TEMPLATE_CONTRATO_<TIPO>` (fallback `..._GENERICO`).
+Placeholders no formato `{{campo}}`; o agente deve gerar `docs/placeholders.md` listando todos os
+placeholders suportados para quem edita os modelos. Placeholder desconhecido no modelo → aviso ao
+validador (não quebra).
+
+LGPD: enviar à IA o mínimo (sem CPF/CNPJ, endereço, telefone; usar placeholders que o código preenche
+depois). Provedor com política de não-treino em dados de API.
+
+---------------------------------------------------------------------------------------------------
+## 15. FLUXOGRAMA VISUAL (WF-08)
+
+Entrada: `projeto_id`. Saída: PNG enviado ao solicitante e salvo como `fluxograma.png`.
+Algoritmo (`gerar_mermaid`):
+1. Carregar template (todas as etapas e transições) → nós e arestas base (cinza, tracejadas).
+2. Carregar ações não revertidas em ordem → arestas percorridas (sólidas, rotuladas com
+   `seq. tipo_acao (autor, dd/mm)`); ações revertidas em vermelho tracejado se `FLUXO_MOSTRAR_REVERTIDAS`.
+3. Estilo dos nós: visitado (verde), atual (amarelo, negrito, com responsável e prazo), futuro (cinza),
+   terminal (azul/vermelho).
+4. Cabeçalho: código, nome, tipo, status, dias em andamento.
+5. POST para renderer (`MERMAID_RENDER_URL`, ex. container `minlag/mermaid-cli` atrás de mini-API ou
+   Kroki `POST /mermaid/png`) → PNG.
+Opção `/fluxograma P-... simples` mostra só o caminho percorrido.
+
+---------------------------------------------------------------------------------------------------
+## 16. VARIÁVEIS DE AMBIENTE (.env)
+
+```dotenv
+# --- Geral
+TZ=America/Sao_Paulo
+AMBIENTE=producao                 # producao|homologacao (homologacao usa outro Drive/planilha/bots)
+BASE_URL_PUBLICA=https://ej-fluxo.exemplo.com
+LOG_NIVEL=info
+
+# --- Banco
+POSTGRES_HOST=postgres
+POSTGRES_DB=ej_fluxo
+POSTGRES_USER=ej
+POSTGRES_PASSWORD=__secret__
+
+# --- Feature flags (canais)
+CANAL_TELEGRAM_ATIVO=true
+CANAL_WHATSAPP_ATIVO=false
+CANAL_EMAIL_ATIVO=true
+CANAL_FORMS_ATIVO=true
+NOTIFICACAO_TELEGRAM_ATIVA=true
+NOTIFICACAO_WHATSAPP_ATIVA=false
+NOTIFICACAO_EMAIL_ATIVA=true
+CANAL_FALLBACK=email
+
+# --- Feature flags (funcionalidades)
+FEATURE_IA_DOCUMENTOS=true
+FEATURE_NLU=false
+FEATURE_FLUXOGRAMA=true
+FEATURE_RODIZIO=true
+FEATURE_SLA_LEMBRETES=true
+FEATURE_EXPORT_LOG_DRIVE=true
+FEATURE_REVERSAO=true
+ENVIO_AUTOMATICO_CLIENTE=false    # v1: sempre false (envio manual). Ver §14.2
+FEATURE_EDITAR_PRECOS_CANAL=true
+EXIGIR_RESPONSAVEL_ATRIBUIDO=false
+
+# --- Regras
+JANELA_REVERSAO_HORAS=48
+RODIZIO_ESTRATEGIA=round_robin     # único valor suportado na v1 (alfabético)
+LEMBRETE_INTERVALO_HORAS=24
+ESCALONAR_APOS_LEMBRETES=2
+DIAS_AUTO_ABANDONO=30
+HORARIO_NOTIFICACAO_INICIO=08:00
+HORARIO_NOTIFICACAO_FIM=21:00
+NOTIFICAR_FIM_DE_SEMANA=false
+SESSAO_TTL_MIN=30
+ARQUIVO_TAMANHO_MAX_MB=25
+ARQUIVO_EXTENSOES_PERMITIDAS=pdf,png,jpg,jpeg,docx,xlsx,zip,stl,3mf,step
+FLUXO_MOSTRAR_REVERTIDAS=true
+
+# --- Telegram
+TELEGRAM_BOT_TOKEN=__secret__
+TELEGRAM_WEBHOOK_SECRET=__secret__
+
+# --- WhatsApp
+WHATSAPP_PROVIDER=cloud_api        # cloud_api|evolution
+WHATSAPP_TOKEN=__secret__
+WHATSAPP_PHONE_NUMBER_ID=
+WHATSAPP_APP_SECRET=__secret__
+WHATSAPP_VERIFY_TOKEN=__secret__
+
+# --- E-mail
+IMAP_HOST= / IMAP_USER= / IMAP_PASSWORD=__secret__
+SMTP_HOST= / SMTP_USER= / SMTP_PASSWORD=__secret__
+EMAIL_REMETENTE="Therion Bot <fluxo@ej.exemplo.com>"
+EMAIL_EXIGIR_DKIM=true
+
+# --- Google
+GOOGLE_SA_JSON_PATH=/run/secrets/google_sa.json
+DRIVE_RAIZ_ID=
+SHEETS_MEMBROS_ID=
+SHEETS_MEMBROS_ABA=Membros
+SHEETS_PRECOS_ID=                  # planilha do Financeiro
+SHEETS_PRECOS_ABA=Precos
+DOCS_TEMPLATE_ORCAMENTO_GENERICO=
+DOCS_TEMPLATE_CONTRATO_GENERICO=
+# DOCS_TEMPLATE_ORCAMENTO_WEBSITE=, DOCS_TEMPLATE_CONTRATO_IMPRESSAO_MODELAGEM_3D=, ...
+SYNC_MEMBROS_CRON="*/15 * * * *"
+
+# --- IA
+IA_PROVEDOR=anthropic
+IA_MODELO=claude-sonnet-5-5
+IA_API_KEY=__secret__
+IA_MAX_REGENERACOES=3
+IA_TIMEOUT_S=90
+
+# --- Fluxograma
+MERMAID_RENDER_URL=http://kroki:8000/mermaid/png
+
+# --- Segurança
+API_HMAC_SECRET=__secret__
+FORMS_HMAC_SECRET=__secret__
+RATE_LIMIT_POR_MIN=20
+```
+Regras: todo workflow lê flags no início via nó "Config" (Code node que retorna `$env` tipado);
+canal/feature desligado → retorna resposta educada "função desativada" e não executa efeitos.
+Segredos NUNCA em workflows exportados; usar Credentials do n8n ou `$env`.
+`N8N_BLOCK_ENV_ACCESS_IN_NODE=false` necessário para Code nodes lerem `$env`.
+
+---------------------------------------------------------------------------------------------------
+## 17. WORKFLOWS N8N (nó a nó)
+
+Convenção: nomes `WF-NN Nome`. Subworkflows chamados com "Execute Workflow" passando JSON. Todo
+workflow tem `errorWorkflow = WF-99`. Lógica não-trivial vive em `lib/*.js` (§18), carregada nos Code
+nodes (copiada no deploy por `scripts/build_workflows.js`, que injeta o código de `lib/` nos nós
+marcados com `// @include lib/<arquivo>.js`).
+
+### WF-01a Entrada Telegram
+1. **Webhook** `POST /telegram` (responder imediatamente 200; "Respond: Immediately").
+2. **IF** header `x-telegram-bot-api-secret-token` == `$env.TELEGRAM_WEBHOOK_SECRET` → senão Stop.
+3. **IF** `CANAL_TELEGRAM_ATIVO`.
+4. **Code: normalizar_telegram** (`lib/normalizadores.js#telegram`) → Comando Normalizado
+   (message, callback_query, document, photo; `idempotency_key = telegram:update:<update_id>`).
+5. **Execute Workflow** → WF-03 Roteador.
+6. **Execute Workflow** → WF-05 Responder (com `canal=telegram`, `chat_id`, resposta).
+   (Para callback_query: também `answerCallbackQuery`.)
+
+### WF-01b Entrada WhatsApp
+1. **Webhook** `GET /whatsapp` → **Respond** `hub.challenge` se `hub.verify_token` confere.
+2. **Webhook** `POST /whatsapp` → **Code: verificar_assinatura_meta** (HMAC SHA256 do raw body com
+   `WHATSAPP_APP_SECRET`) → **Respond 200**.
+3. **Code: normalizar_whatsapp** (texto, interactive button_reply/list_reply, document, image;
+   ignorar `statuses`). `idempotency_key = whatsapp:<message.id>`.
+4. → WF-03 → WF-05.
+
+### WF-01c Entrada E-mail
+1. **Email Trigger (IMAP)** caixa `INBOX`, marcar como lido, baixar anexos.
+2. **Code: normalizar_email**: extrai `[P-AAAA-NNNN]` do assunto, primeira linha não vazia do corpo
+   como comando, linhas `campo: valor` como campos, ignora citação (`>`/assinatura).
+   `idempotency_key = email:<Message-ID>`. Verifica `Authentication-Results` (dkim=pass).
+3. → WF-03 → WF-05 (resposta como reply no mesmo thread: `In-Reply-To`).
+
+### WF-01d Entrada Forms
+1. **Webhook** `POST /forms` → **Code: verificar_hmac** → **Respond 200**.
+2. **Code: normalizar_forms**: mapeia `form_id` → comando (`novo` ou `acao` + tipo) usando
+   `config/forms.yaml`; respostas → campos; uploads (IDs do Drive) → arquivos já no Drive.
+   `idempotency_key = forms:<responseId>`.
+3. → WF-03 → WF-05 (resposta por e-mail/canal preferido, pois o Forms não tem canal de volta).
+
+Apps Script (no Form):
+```javascript
+function onFormSubmit(e) {
+  const payload = JSON.stringify({
+    form_id: e.source.getId(),
+    response_id: e.response.getId(),
+    email: e.response.getRespondentEmail(),
+    respostas: e.response.getItemResponses().map(r => ({ titulo: r.getItem().getTitle(), valor: r.getResponse() })),
+    enviado_em: e.response.getTimestamp().toISOString()
+  });
+  const secret = PropertiesService.getScriptProperties().getProperty('FORMS_HMAC_SECRET');
+  const sig = Utilities.computeHmacSha256Signature(payload, secret)
+    .map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
+  UrlFetchApp.fetch(PropertiesService.getScriptProperties().getProperty('WEBHOOK_URL'), {
+    method: 'post', contentType: 'application/json', payload,
+    headers: { 'X-Signature': 'sha256=' + sig }, muteHttpExceptions: true
+  });
+}
+```
+
+### WF-02 Identificação (subworkflow; chamado pelo WF-03)
+1. **Postgres**: `SELECT * FROM membros WHERE <coluna do canal> = $1 AND ativo`.
+2. **IF** encontrado → retorna `{membro}`.
+3. Senão **IF** comando é `vincular`/`codigo` → permite seguir sem membro.
+4. Senão → `{erro: NAO_IDENTIFICADO}`.
+5. **Code: rate_limit** (contagem por id_externo na última janela, tabela ou Redis opcional).
+
+### WF-03 Roteador de Comandos
+1. **Execute Workflow Trigger** (recebe Comando Normalizado).
+2. **Postgres: checar idempotência** `SELECT resposta FROM acoes WHERE idempotency_key=$1` (e/ou
+   tabela `requisicoes_processadas`) → se existir, retorna resposta anterior (Stop).
+3. → WF-02 Identificação.
+4. **Code: carregar_sessao** (se há diálogo aberto, mescla entrada com estado).
+5. **Code: parse_comando** (`lib/comandos.js`) → `{comando, args}`.
+6. **Switch** por `comando`:
+   - `ajuda` → Code template de texto.
+   - `meus` / `projetos` / `projeto` / `historico` → Postgres queries (`sql/consultas.sql`) → Code
+     formatar.
+   - `novo` → WF-04 (operação `criar_projeto`).
+   - `acao` / `pausar` / `retomar` / `abandonar` / `reverter` / `reatribuir` / `comentar` → WF-04.
+   - `fluxograma` → WF-08.
+   - `canal` / `ausente` / `disponivel` → Postgres UPDATE + escrita na planilha.
+   - `vincular` / `codigo` → Code + Postgres + SMTP.
+   - `cancelar` → apagar sessão.
+   - desconhecido → se `FEATURE_NLU` → **Code/HTTP: nlu_extrair** → confirmação; senão ajuda.
+7. **Code: salvar_sessao** se resposta for `CAMPOS_FALTANTES` ou confirmação pendente.
+8. Retorna Resposta.
+
+### WF-04 Motor de Fluxo (núcleo — tudo dentro de UMA transação)
+Entrada: `{operacao, membro, projeto_codigo?, tipo_acao, campos, arquivos, observacoes, canal, idempotency_key, confirmado}`.
+1. **Code: Config**.
+2. **Postgres (transação)**: `BEGIN; SELECT * FROM projetos WHERE codigo=$1 FOR UPDATE;`
+   (n8n Postgres node não mantém transação entre nós → implementar passos 2–9 como **uma única
+   função PL/pgSQL** `registrar_acao(jsonb) RETURNS jsonb` OU um único Code node usando `pg` client
+   com transação. **Decisão: PL/pgSQL para gravação + Code node para validação prévia.**)
+   Pré-validação no Code node (`lib/motor.js#validar`): carrega projeto, template, etapa atual,
+   valida autorização (§8.1), transição, campos (§8.2), guardas. Se faltar campo → retorna
+   `CAMPOS_FALTANTES` (sem gravar). Se não `confirmado` e ação for destrutiva (reverter, abandonar) →
+   retorna pedido de confirmação.
+3. **Execute Workflow WF-06 (upload de arquivos)** — antes da gravação, para ter `drive_file_id`.
+   (Se a gravação falhar depois, arquivos ficam em `_pendentes/` e um job limpa após 24h.)
+4. **Code: escolher_responsavel** (`lib/rodizio.js`) — calcula candidato (será confirmado no SQL).
+5. **Postgres: `SELECT registrar_acao($json)`** — função faz, atomicamente:
+   a. `SELECT ... FOR UPDATE` no projeto; compara `versao` esperada (otimista) → CONFLITO se mudou.
+   b. Revalida transição e permissão (defesa em profundidade).
+   c. `seq = max(seq)+1`; INSERT em `acoes`.
+   d. Se muda de etapa: UPDATE `etapas.data_saida` da atual; INSERT nova etapa com
+      responsável/prazo; UPDATE `rodizio`.
+   e. UPDATE `projetos` (etapa_atual_id, status, campos projetados, data_final, versao+1).
+   f. Para `reverter`: UPDATE `acoes.revertida_por_id` do alvo.
+   g. Retorna `{acao, projeto, etapa_nova, efeitos[], destinatarios[]}`.
+6. **Split efeitos** → **Switch** por efeito → Execute Workflow (WF-06/WF-07) de forma
+   **assíncrona** (n8n: "Wait for sub-workflow: false") para não travar a resposta.
+7. **Execute Workflow WF-11 regenerar_log** (assíncrono) se `FEATURE_EXPORT_LOG_DRIVE`.
+8. **Execute Workflow WF-05 Notificar** destinatários: responsável atribuído da nova etapa (ou toda
+   a diretoria se nulo), membro original do projeto (resumo), quem foi afetado por reversão.
+9. Retorna Resposta `ACAO_REGISTRADA`.
+
+### WF-05 Notificações / Respostas
+1. **Execute Workflow Trigger** `{destinatarios[] | resposta_direta, mensagem, botoes, anexos}`.
+2. **Code: resolver_canal** por membro (preferido → habilitado + flag ativa → fallback).
+3. **Code: horario_silencioso** (notificações não urgentes adiadas: INSERT em `notificacoes` com
+   status pendente; respostas diretas sempre enviadas).
+4. **Postgres INSERT `notificacoes`** (outbox).
+5. **Switch canal** → **Telegram** (sendMessage com `reply_markup.inline_keyboard`; sendPhoto para
+   PNG) | **HTTP WhatsApp** (`/messages`, tipo `interactive` até 3 botões, `template` fora da janela de
+   24h) | **Send Email** (HTML simples; botões viram instruções "responda com: aprovar").
+6. **Postgres UPDATE** status enviada/falhou; falha → retry com backoff (WF-10 reprocessa pendentes
+   com `tentativas < 5`), depois fallback para e-mail.
+Renderização por canal em `lib/render.js` (Telegram MarkdownV2 com escape; WhatsApp texto + botões;
+e-mail HTML).
+
+### WF-06 Drive/Docs
+Operações via Switch: `criar_pasta_projeto`, `baixar_e_subir` (Telegram getFile / WhatsApp media URL /
+anexo IMAP → Google Drive Upload), `mover`, `lixeira`, `copiar_template`, `substituir_placeholders`
+(Google Docs node "Update: replaceAllText"), `exportar_pdf` (Drive export `application/pdf`).
+Validar extensão/tamanho antes do upload. Retorna `{drive_file_id, url}`.
+
+### WF-07 IA Documentos
+Conforme §14: Postgres (contexto) → Code `calcular_orcamento` → Code montar prompt → **HTTP Request**
+(ou nó Anthropic) com timeout/retry 2x → Code validar JSON (schema) → WF-06 copiar template +
+placeholders → Postgres INSERT documentos → WF-04 ação de sistema `*_rascunho_pronto` → WF-05 notificar
+validador com link e botões.
+
+### WF-08 Fluxograma
+Trigger → Postgres (projeto, template, ações, etapas) → Code `gerar_mermaid` → HTTP POST renderer
+(responseFormat: file) → WF-06 upload/atualiza `fluxograma.png` → retorna binário para WF-05.
+
+### WF-09 Sync Membros (cron `SYNC_MEMBROS_CRON` + comando admin `/sync`)
+Google Sheets Read → Code `validar_linhas` (email válido, diretoria no enum, telefone → E.164; linhas
+inválidas listadas) → Postgres UPSERT por email → Code diff (novos/desativados/indisponíveis) →
+novos: e-mail de boas-vindas; desativados/indisponíveis: reatribuir etapas abertas (WF-04
+`reatribuir` como sistema) → relatório de erros para admins.
+
+### WF-10 SLA, lembretes e reenvio (cron horário)
+Postgres: etapas vencidas (projeto ativo) → Code agrupar por responsável → WF-05 (lembrete ou
+escalonamento) → reprocessar `notificacoes` pendentes/falhas → sugerir abandono (§8.4) → limpar
+`sessoes_chat`/`vinculos_pendentes` expirados e arquivos `_pendentes/` > 24h.
+
+### WF-11 Backup / Export
+- `regenerar_log(projeto_id)`: Postgres ações → Code JSONL → Drive (substitui `log.jsonl`).
+- Cron diário 03:00: `pg_dump` (Execute Command, ou container de backup separado) → `_exports/` com
+  retenção de 30 diários + 12 mensais. Exportar workflows n8n (CLI `n8n export:workflow --all`) para
+  o repositório git.
+
+### WF-12 Relatórios / Dashboard
+Cron semanal (segunda 09:00) e comando `/relatorio` (admin/presidência): projetos por etapa, tempo
+médio por etapa, taxa de conversão orçamento→contrato, projetos parados > SLA, receita contratada no
+período. Envio por e-mail/Telegram + (MAY) aba "Dashboard" numa planilha Google atualizada ou
+Metabase/Grafana lendo o Postgres (views em `sql/views.sql`).
+
+### WF-99 Error Handler
+Error Trigger → Code formatar (workflow, nó, mensagem, execution id, sem dados pessoais) → Telegram
+para grupo de admins/tech → se a execução tinha remetente, responde "Erro interno, a equipe foi
+avisada (ref: <execution_id>)".
+
+### 17.1 Esqueleto importável do WF-01a + WF-03 (ponto de partida)
+O agente deve gerar os JSON completos de todos os workflows em `n8n/workflows/`. Exemplo mínimo:
+```json
+{
+  "name": "WF-01a Entrada Telegram",
+  "nodes": [
+    { "name": "Webhook", "type": "n8n-nodes-base.webhook", "typeVersion": 2, "position": [0,0],
+      "parameters": { "httpMethod": "POST", "path": "telegram", "responseMode": "onReceived" } },
+    { "name": "Segredo OK?", "type": "n8n-nodes-base.if", "typeVersion": 2, "position": [220,0],
+      "parameters": { "conditions": { "conditions": [ { "leftValue": "={{ $json.headers['x-telegram-bot-api-secret-token'] }}",
+        "rightValue": "={{ $env.TELEGRAM_WEBHOOK_SECRET }}", "operator": { "type": "string", "operation": "equals" } } ] } } },
+    { "name": "Normalizar", "type": "n8n-nodes-base.code", "typeVersion": 2, "position": [440,0],
+      "parameters": { "jsCode": "// @include lib/normalizadores.js\nreturn [{ json: normalizarTelegram($json.body) }];" } },
+    { "name": "Roteador", "type": "n8n-nodes-base.executeWorkflow", "typeVersion": 1, "position": [660,0],
+      "parameters": { "workflowId": "={{ $env.WF_ROTEADOR_ID }}" } },
+    { "name": "Responder", "type": "n8n-nodes-base.executeWorkflow", "typeVersion": 1, "position": [880,0],
+      "parameters": { "workflowId": "={{ $env.WF_NOTIFICAR_ID }}" } }
+  ],
+  "connections": {
+    "Webhook":    { "main": [[{ "node": "Segredo OK?", "type": "main", "index": 0 }]] },
+    "Segredo OK?":{ "main": [[{ "node": "Normalizar", "type": "main", "index": 0 }], []] },
+    "Normalizar": { "main": [[{ "node": "Roteador", "type": "main", "index": 0 }]] },
+    "Roteador":   { "main": [[{ "node": "Responder", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "errorWorkflow": "WF-99" }
+}
+```
+(Ajustar `typeVersion` à versão do n8n instalada; IDs dos subworkflows via env `WF_*_ID` ou seleção
+por nome após import.)
+
+---------------------------------------------------------------------------------------------------
+## 18. CÓDIGOS E RESPONSABILIDADES
+
+Todos em `lib/`, JavaScript puro (ES2020, sem dependências externas exceto onde dito), funções puras
+sempre que possível, com testes em `tests/` (Node test runner `node --test`).
+
+| Arquivo | Funções | Responsabilidade |
+|---|---|---|
+| `lib/config.js` | `lerConfig(env)` | Converte `$env` em objeto tipado (bools, ints, listas); valida obrigatórias; lança erro claro. |
+| `lib/normalizadores.js` | `normalizarTelegram(update)`, `normalizarWhatsapp(body)`, `normalizarEmail(msg)`, `normalizarForms(payload, mapa)` | Converter payload de cada canal no Comando Normalizado (§12). Nenhuma regra de negócio. |
+| `lib/seguranca.js` | `verificarHmac(raw, sig, secret)`, `verificarMeta(raw, sig, secret)`, `rateLimit(...)` | Assinaturas e limites; comparação em tempo constante. |
+| `lib/comandos.js` | `parseComando(texto)`, `parseCampos("a=1 b='x y'")`, `extrairCodigoProjeto(str)` | Parser tolerante (com/sem barra, acentos, aliases `aprovar`→ação contextual). |
+| `lib/templates.js` | `carregarTemplate(def)`, `transicoesDisponiveis(tpl, etapa)`, `acoesGlobais()`, `validarSchemaTemplate(def)` | Ler e consultar templates de fluxo; validar YAML (etapas referenciadas existem, inicial existe, terminais sem saída, todo nó alcançável). |
+| `lib/autorizacao.js` | `podeExecutar(membro, projeto, etapa, acao, cfg) → {ok, motivo, quemPode}` | Implementa §8.1 exatamente. |
+| `lib/validacao.js` | `validarCampos(defs, campos, arquivos, cfg) → {ok, faltantes[], erros[], normalizados}` | §8.2: tipos, conversões (money "1.234,56"→1234.56, datas dd/mm/aaaa). |
+| `lib/motor.js` | `validar(contexto)`, `planejarAcao(ctx) → plano`, `avaliarGuarda(expr, estado)` | Orquestra validação; produz o plano enviado ao `registrar_acao`. Guardas em mini-DSL segura (sem eval). |
+| `lib/projecao.js` | `projetarEstado(template, acoes[]) → estado` | Replay de eventos não revertidos → estado do projeto. Usado na reversão e em testes de consistência (comparar com tabela `projetos`). |
+| `lib/rodizio.js` | `escolherResponsavel(membros, ultimoMembroNome)` | §8.5: round robin alfabético. Determinístico. |
+| `lib/sla.js` | `calcularPrazo(entrada, slaHoras, pausas)`, `etapasVencidas(...)`, `dentroHorario(...)` | §8.6. |
+| `lib/render.js` | `renderTelegram(resp)`, `renderWhatsapp(resp)`, `renderEmail(resp)`, `escaparMarkdownV2(s)` | Saída por canal; limites (Telegram 4096 chars, WhatsApp 3 botões/10 itens lista). |
+| `lib/mensagens.js` | Textos pt-BR centralizados (`MSG.NAO_AUTORIZADO(quemPode)`, ...) | Facilita revisão de linguagem. |
+| `lib/mermaid.js` | `gerarMermaid(template, etapas, acoes, opcoes)` | §15. Escapa rótulos. |
+| `lib/orcamento.js` | `calcularOrcamento(projeto, precos)` | Valores determinísticos (horas×valor, filamento×preço/g, margem, impostos, arredondamento); `precos` vem da tabela `precos` (planilha do Financeiro). Padrão à vista (`parcelas_padrao=1`). |
+| `lib/precos.js` | `validarLinhaPreco(l)`, `formatarTabelaPrecos(p)`, `podeEditarPreco(membro)` | Sync e comandos `/precos`, `/preco`, `/simular` (§14.1). |
+| `lib/envio_cliente.js` | `enviarDocumentoCliente(...)` | Stub da v1 (§14.2). |
+| `lib/ia.js` | `montarPrompt(tipoDoc, ctx)`, `validarSaidaIA(json)`, `anonimizar(ctx)` | Prompt + schema; remove dados pessoais. |
+| `lib/codigo_projeto.js` | `gerarCodigo(ano, seq)` | `P-2026-0042`. |
+| `sql/schema.sql` | — | DDL §5. |
+| `sql/registrar_acao.sql` | `registrar_acao(jsonb)`, `criar_projeto(jsonb)` | Gravação atômica (§17 WF-04 passo 5). Retorna erros como `{ok:false, codigo}`. |
+| `sql/consultas.sql` | queries nomeadas | `meus_pendentes`, `listar_projetos`, `detalhes_projeto`, `historico`, `etapas_vencidas`. |
+| `sql/views.sql` | views | `vw_pipeline`, `vw_tempo_medio_etapa`, `vw_conversao`. |
+| `scripts/carregar_fluxos.js` | CLI | Valida e carrega `fluxos/*.yaml` (deps: `yaml`, `pg`). |
+| `scripts/build_workflows.js` | CLI | Injeta `lib/*.js` nos Code nodes dos JSON de `n8n/workflows-src/` → `n8n/workflows/`. |
+| `scripts/setup_telegram.js` | CLI | `setWebhook` com secret_token e `setMyCommands`. |
+| `apps_script/forms.gs` | `onFormSubmit` | §17 WF-01d. |
+| `config/forms.yaml` | — | Mapeamento form_id → comando/campos. |
+| `prompts/**` | — | Prompts de IA por tipo/documento. |
+
+Testes mínimos obrigatórios:
+- Templates: validação de grafo (alcançabilidade, terminais).
+- Autorização: matriz diretoria × etapa × ação global, admin, inativo, pausado.
+- Motor: cada transição dos templates com campos válidos/faltantes; guarda de `quitar`.
+- Reversão: avançar 3 vezes, reverter 2, `projetarEstado` == estado esperado; reverter de terminal negado.
+- Rodízio: round-robin pula indisponíveis; ninguém disponível → nulo.
+- Parser: comandos com/sem barra, aspas, acentos, código no meio do texto.
+- Normalizadores: fixtures reais de payload de cada canal em `tests/fixtures/`.
+- Idempotência: mesmo `idempotency_key` duas vezes → uma ação só.
+- Concorrência: duas ações simultâneas no mesmo projeto → uma CONFLITO.
+
+---------------------------------------------------------------------------------------------------
+## 19. ERROS, IDEMPOTÊNCIA, CONCORRÊNCIA
+
+- **Idempotência**: toda entrada tem `idempotency_key` derivada do ID nativo do provedor (webhooks
+  são reentregues). Tabela `requisicoes_processadas(idempotency_key PK, resposta jsonb, criado_em)`
+  gravada ao fim do WF-03; checada no início. `acoes.idempotency_key UNIQUE` é a última barreira.
+- **Concorrência**: `SELECT ... FOR UPDATE` + `projetos.versao`. Conflito → mensagem "O projeto foi
+  alterado por outra pessoa agora, verifique com /projeto P-..." .
+- **Efeitos externos** (Drive, IA, notificação) acontecem DEPOIS do commit e são re-tentáveis; falha
+  em efeito NÃO desfaz a ação; é registrada e alertada (WF-99) e pode ser reexecutada por admin
+  (`/reprocessar <acao_id>`).
+- **Timeouts**: webhooks respondem 200 imediatamente; processamento segue assíncrono.
+- **Falha do Drive** no upload pré-gravação → ação não é registrada, usuário é avisado para reenviar.
+- **LLM fora do ar** → notificar responsável para fazer manualmente; projeto não trava.
+- Logs: sem dados pessoais em mensagens de erro; usar IDs.
+
+---------------------------------------------------------------------------------------------------
+## 20. SEGURANÇA, REDE E LGPD
+
+Rede:
+- Host com n8n+Postgres+renderer em Docker Compose, portas ligadas só em `127.0.0.1`/interface Tailscale.
+- **Cloudflare Tunnel** (`cloudflared`) com ingress apenas para `https://<dominio>/webhook/*` →
+  `http://n8n:5678`; demais paths → 404. WAF/rate limiting do Cloudflare ativado.
+- Editor do n8n acessível somente via Tailscale (`http://<host-tailscale>:5678`), com usuário/senha e
+  2FA se disponível. `N8N_ENCRYPTION_KEY` definido e guardado fora do servidor.
+- Postgres sem porta pública.
+Aplicação:
+- Validação de assinatura em todos os webhooks (§17). Rate limit por remetente.
+- Princípio do menor privilégio na Service Account (só o Shared Drive e a planilha).
+- Segredos via Docker secrets / Credentials do n8n.
+LGPD:
+- Dados de clientes (nome, contato, CPF/CNPJ) e membros: base legal = execução de contrato / legítimo
+  interesse; registrar no termo da EJ.
+- Minimização: bots exibem CPF/CNPJ mascarado; IA não recebe documento/endereço/telefone.
+- Retenção: projetos abandonados há > `RETENCAO_ABANDONADOS_MESES` (padrão 24) têm dados pessoais do
+  cliente anonimizados (job mensal).
+- Mensagens trafegam por terceiros (Meta, Telegram, Google): documentar no aviso de privacidade.
+- Direito de exclusão: comando admin `/anonimizar_cliente <id>`.
+
+---------------------------------------------------------------------------------------------------
+## 21. BACKUP, OBSERVABILIDADE E DASHBOARD
+- Backups conforme WF-11; testar restauração trimestralmente (checklist em `docs/runbook.md`).
+- Saúde: `/webhook/health`; Uptime Kuma (ou similar) monitorando e alertando no Telegram.
+- Métricas via views SQL (§18) para WF-12 e dashboard opcional (Metabase lendo Postgres via Tailscale).
+- Teste de consistência diário: para cada projeto, `projetarEstado(acoes)` == linha de `projetos`;
+  divergência → alerta.
+
+---------------------------------------------------------------------------------------------------
+## 22. CONTINUIDADE DE GESTÃO (rotação anual da EJ)
+- `docs/README.md` (visão geral), `docs/runbook.md` (deploy, backup, restauração, rotação de
+  segredos, troubleshooting), `docs/manual_usuario.md` (comandos por diretoria, com prints),
+  `docs/adicionar_servico.md` (§6.3).
+- Todos os ativos em contas institucionais da EJ (Shared Drive, e-mail do bot, Bot do Telegram
+  criado por conta institucional, Cloudflare/Tailscale da organização), nunca pessoais.
+- Transição de gestão: checklist de offboarding (desativar na planilha, revogar Tailscale, trocar
+  senhas compartilhadas) e onboarding (planilha, vínculo de conta, leitura do manual).
+- Responsável técnico definido por gestão (papel `is_admin`), com pelo menos 2 admins sempre.
+
+---------------------------------------------------------------------------------------------------
+## 23. ESTRUTURA DE REPOSITÓRIO
+```
+therion-fluxo/
+  docker-compose.yml        # n8n, postgres, kroki (mermaid), cloudflared, backup
+  .env.example
+  fluxos/ schema.json website.yaml impressao_modelagem_3d.yaml
+  config/ forms.yaml
+  prompts/ generico/{orcamento,contrato}.md website/... impressao_modelagem_3d/...
+  lib/ (§18)
+  sql/ schema.sql registrar_acao.sql consultas.sql views.sql seed.sql
+  n8n/ workflows-src/*.json workflows/*.json (gerados) credentials.example.md
+  scripts/ carregar_fluxos.js build_workflows.js setup_telegram.js
+  apps_script/ forms.gs
+  tests/ fixtures/ *.test.js
+  docs/ README.md runbook.md manual_usuario.md adicionar_servico.md arquitetura.md
+```
+
+---------------------------------------------------------------------------------------------------
+## 24. PLANO DE IMPLEMENTAÇÃO + CRITÉRIOS DE ACEITE
+
+Fase 1 — Núcleo (sem canais externos)
+- schema.sql, templates YAML + validação, lib (autorização, validação, motor, projeção, rodízio),
+  `registrar_acao`, testes. Aceite: todos os testes de §18 passam; script consegue simular um projeto
+  do início ao fim via CLI.
+Fase 2 — Telegram + Drive + Sync de membros
+- WF-01a, WF-02, WF-03, WF-04, WF-05 (Telegram), WF-06, WF-09, WF-99. Aceite: membro vincula conta,
+  cria projeto, avança todas as etapas com arquivos indo para as pastas corretas, não-autorizado é
+  barrado com mensagem que diz quem pode agir, reversão funciona.
+Fase 3 — Fluxograma, SLA, E-mail, Forms
+- WF-08, WF-10, WF-01c, WF-01d, WF-11. Aceite: `/fluxograma` retorna PNG correto; lembrete dispara em
+  etapa vencida; ação por resposta de e-mail funciona; form cria projeto.
+Fase 4 — IA de documentos
+- WF-07, WF-09b (sync preços), comandos `/precos` `/preco` `/simular`, prompts, templates Docs. Aceite: escopo enviado gera rascunho em < 2 min;
+  reprovação regenera com motivo; valores batem com `calcularOrcamento`.
+Fase 5 — WhatsApp, relatórios, NLU, LGPD jobs
+- WF-01b, WF-12, NLU, anonimização. Aceite: mesmos cenários da Fase 2 via WhatsApp.
+
+Definição de pronto (todas as fases): flags respeitadas; sem segredos no repo; docs atualizados;
+workflows exportados em `n8n/workflows/`.
+
+---------------------------------------------------------------------------------------------------
+## 25. DECISÕES TOMADAS (antes questões em aberto)
+1. **WhatsApp**: adiado para a Fase 5. Fases 1–4 implementam apenas **Telegram e E-mail** (+ Forms).
+   `CANAL_WHATSAPP_ATIVO=false` até lá.
+2. **Envio ao cliente**: manual na v1; automático no futuro → pontos de extensão em §14.2
+   (`ENVIO_AUTOMATICO_CLIENTE`, `lib/envio_cliente.js`, `WF-13`, comentários `TODO(ENVIO_AUTOMATICO_CLIENTE)`).
+3. **Rodízio**: round robin sobre lista em ordem alfabética (§8.5).
+4. **Diretores**: coluna `cargo` (`membro`|`diretor`) já existe na planilha de membros (§10).
+5. **Preços**: planilha da diretoria Financeira + configuração via canal (`/precos`, `/preco`, `/simular`) (§14.1).
+6. **Modelos de orçamento/contrato**: já disponíveis no Google Docs; IDs por env (§14.3).
+7. **Assinatura**: manual (upload do PDF assinado na ação `contrato_assinado`). Assinatura eletrônica
+   fica para fase futura (`TODO(ASSINATURA_ELETRONICA)`).
+8. **Parcelamento**: padrão à vista; parcelamento não é requisito central (§6.1, `parcelas_padrao=1`).
+9. **Hospedagem**: **VPS própria** com Docker Compose; Tailscale instalado na VPS; Cloudflare Tunnel
+   para os webhooks; nenhuma porta pública aberta além de SSH (de preferência só via Tailscale, com
+   firewall `ufw` negando entrada por padrão). Recomendado: ≥ 2 vCPU, 4 GB RAM, 40 GB disco.
