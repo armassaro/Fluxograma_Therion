@@ -21,7 +21,7 @@
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "parameters": {
-        "jsCode": "// ==== Módulos de lib/ embutidos por scripts/build_workflows.js. NÃO edite aqui: edite lib/ e rode `npm run build`. ====\nconst __mods = {}, __cache = {};\nfunction __req(n) { if (!n.startsWith('./')) return require(n); if (__cache[n]) return __cache[n].exports; if (!__mods[n]) throw new Error('módulo não embutido: ' + n); const module = { exports: {} }; __cache[n] = module; __mods[n](module, module.exports, __req); return module.exports; }\n__mods['./config'] = function (module, exports, require) {\n'use strict';\n/**\n * Converte variáveis de ambiente (strings) num objeto de configuração tipado.\n * Todo workflow/roteiro chama lerConfig() no início; nenhuma outra parte lê `env` direto.\n */\n\nfunction bool(v, padrao) {\n  if (v === undefined || v === null || v === '') return padrao;\n  return ['1', 'true', 'sim', 'yes', 'on'].includes(String(v).trim().toLowerCase());\n}\nfunction int(v, padrao) {\n  const n = parseInt(v, 10);\n  return Number.isFinite(n) ? n : padrao;\n}\nfunction lista(v, padrao) {\n  if (v === undefined || v === null || String(v).trim() === '') return padrao;\n  return String(v).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);\n}\n\n/**\n * @param {Record<string,string|undefined>} env  ex.: process.env ou $env do n8n\n */\nfunction lerConfig(env = {}) {\n  return {\n    tz: env.TZ || 'America/Sao_Paulo',\n    canais: {\n      telegram: bool(env.CANAL_TELEGRAM_ATIVO, true),\n      whatsapp: bool(env.CANAL_WHATSAPP_ATIVO, false),   // Fase 5\n      email: bool(env.CANAL_EMAIL_ATIVO, false),         // entrada por e-mail: Fase 3\n      forms: bool(env.CANAL_FORMS_ATIVO, false),         // Fase 3\n    },\n    notificacoes: {\n      telegram: bool(env.NOTIFICACAO_TELEGRAM_ATIVA, true),\n      whatsapp: bool(env.NOTIFICACAO_WHATSAPP_ATIVA, false),\n      email: bool(env.NOTIFICACAO_EMAIL_ATIVA, true),\n    },\n    features: {\n      rodizio: bool(env.FEATURE_RODIZIO, true),\n      reversao: bool(env.FEATURE_REVERSAO, true),\n      drive: bool(env.FEATURE_DRIVE, true),\n      fluxograma: bool(env.FEATURE_FLUXOGRAMA, false),      // Fase 3\n      iaDocumentos: bool(env.FEATURE_IA_DOCUMENTOS, false), // Fase 4\n      // TODO(ENVIO_AUTOMATICO_CLIENTE): quando implementado, o efeito `enviar_documento_cliente` usa esta flag.\n      envioAutomaticoCliente: bool(env.ENVIO_AUTOMATICO_CLIENTE, false),\n    },\n    sla: {\n      lembreteIntervaloHoras: int(env.LEMBRETE_INTERVALO_HORAS, 24),\n      escalonarAposLembretes: int(env.ESCALONAR_APOS_LEMBRETES, 2),\n      diasAutoAbandono: int(env.DIAS_AUTO_ABANDONO, 30),\n      horarioInicio: env.HORARIO_NOTIFICACAO_INICIO || '08:00',\n      horarioFim: env.HORARIO_NOTIFICACAO_FIM || '21:00',\n      notificarFimDeSemana: bool(env.NOTIFICAR_FIM_DE_SEMANA, false),\n      tz: env.TZ || 'America/Sao_Paulo',\n    },\n    exigirResponsavelAtribuido: bool(env.EXIGIR_RESPONSAVEL_ATRIBUIDO, false),\n    janelaReversaoHoras: int(env.JANELA_REVERSAO_HORAS, 48),\n    sessaoTtlMin: int(env.SESSAO_TTL_MIN, 30),\n    rateLimitPorMin: int(env.RATE_LIMIT_POR_MIN, 20),\n    arquivoTamanhoMaxMb: int(env.ARQUIVO_TAMANHO_MAX_MB, 20),\n    arquivoExtensoes: lista(env.ARQUIVO_EXTENSOES_PERMITIDAS,\n      ['pdf', 'png', 'jpg', 'jpeg', 'docx', 'xlsx', 'zip', 'stl', '3mf', 'step']),\n    driveRaizId: env.DRIVE_RAIZ_ID || '',\n    emailRemetente: env.EMAIL_REMETENTE || 'Therion Bot <fluxo@example.com>',\n    telegramApiBase: (env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\\/+$/, ''),\n  };\n}\n\nmodule.exports = { lerConfig };\n\n};\n__mods['./render'] = function (module, exports, require) {\n'use strict';\n/**\n * Renderização por canal: transforma mensagens neutras em \"envios\" prontos para o WF-05.\n *   telegram -> { canal:'telegram', membro_id, registrar, telegram: { metodo, corpo } }   (Bot API)\n *   email    -> { canal:'email',    membro_id, registrar, email: { para, assunto, texto } }\n */\n\nconst LIMITE_TELEGRAM = 4096;\n\n/** Quebra um texto longo em partes de até `limite`, preferindo quebras de linha. */\nfunction dividirTexto(texto, limite = LIMITE_TELEGRAM) {\n  const partes = [];\n  let resto = String(texto ?? '');\n  while (resto.length > limite) {\n    let corte = resto.lastIndexOf('\\n', limite);\n    if (corte < limite / 2) corte = limite;\n    partes.push(resto.slice(0, corte));\n    resto = resto.slice(corte).replace(/^\\n/, '');\n  }\n  if (resto || !partes.length) partes.push(resto);\n  return partes;\n}\n\n/** Só notificações vão para a tabela `notificacoes`; respostas diretas e mensagens sigilosas (código de vínculo) não. */\nfunction deveRegistrar(msg) { return !msg.resposta_direta && !msg.sigiloso; }\n\nfunction tecladoTelegram(botoes) {\n  if (!botoes || !botoes.length) return undefined;\n  return {\n    inline_keyboard: botoes.map((b) => [{\n      text: String(b.rotulo).slice(0, 60),\n      callback_data: String(b.dados).slice(0, 64),   // limite da Bot API\n    }]),\n  };\n}\n\nfunction renderTelegram(msg) {\n  const partes = dividirTexto(msg.texto || ' ');\n  return partes.map((texto, i) => {\n    const corpo = { chat_id: msg.destino, text: texto || ' ', disable_web_page_preview: true };\n    const teclado = i === partes.length - 1 ? tecladoTelegram(msg.botoes) : undefined;\n    if (teclado) corpo.reply_markup = teclado;\n    return { canal: 'telegram', membro_id: msg.membro_id || null, registrar: deveRegistrar(msg), telegram: { metodo: 'sendMessage', corpo } };\n  });\n}\n\nfunction renderEmail(msg) {\n  let texto = msg.texto || '';\n  if (msg.botoes && msg.botoes.length) texto += '\\n\\nPara agir, use o bot no Telegram.';\n  return [{\n    canal: 'email', membro_id: msg.membro_id || null, registrar: deveRegistrar(msg),\n    // essencial = sai mesmo com NOTIFICACAO_EMAIL_ATIVA=false (ex.: código de vínculo, que só existe por e-mail)\n    essencial: !!msg.sigiloso,\n    email: { para: msg.destino, assunto: msg.assunto || 'Therion Fluxo', texto },\n  }];\n}\n\n/**\n * @param {object[]} mensagens  [{canal, destino, texto, botoes?, assunto?, membro_id?}]\n * @param {{id:string}|null} callback  se a entrada foi um clique de botão, responde-o (tira o \"carregando\")\n */\nfunction montarEnvios(mensagens, callback = null) {\n  const envios = [];\n  if (callback && callback.id) {\n    envios.push({ canal: 'telegram', membro_id: null, registrar: false,\n      telegram: { metodo: 'answerCallbackQuery', corpo: { callback_query_id: callback.id } } });\n  }\n  for (const m of mensagens || []) {\n    if (!m || !m.destino) continue;\n    if (m.canal === 'telegram') envios.push(...renderTelegram(m));\n    else if (m.canal === 'email') envios.push(...renderEmail(m));\n  }\n  return envios;\n}\n\nmodule.exports = { montarEnvios, renderTelegram, renderEmail, dividirTexto, tecladoTelegram, LIMITE_TELEGRAM };\n\n};\n// ==== Fim dos módulos embutidos. Código do nó: ====\nconst { mensagens, callback } = $input.first().json;\nconst cfg = __req('./config').lerConfig($env);\nconst envios = __req('./render').montarEnvios(mensagens || [], callback || null)\n  // respeita as chaves gerais de notificação; respostas diretas no Telegram e e-mails essenciais\n  // (código de vínculo) sempre saem\n  .filter((e) => (e.canal === 'email' ? cfg.notificacoes.email || e.essencial : true));\nreturn envios.map((e) => ({ json: e }));"
+        "jsCode": "// ==== Módulos de lib/ embutidos por scripts/build_workflows.js. NÃO edite aqui: edite lib/ e rode `npm run build`. ====\nconst __mods = {}, __cache = {};\nfunction __req(n) { if (!n.startsWith('./')) return require(n); if (__cache[n]) return __cache[n].exports; if (!__mods[n]) throw new Error('módulo não embutido: ' + n); const module = { exports: {} }; __cache[n] = module; __mods[n](module, module.exports, __req); return module.exports; }\n__mods['./config'] = function (module, exports, require) {\n'use strict';\n/**\n * Converte variáveis de ambiente (strings) num objeto de configuração tipado.\n * Todo workflow/roteiro chama lerConfig() no início; nenhuma outra parte lê `env` direto.\n */\n\nfunction bool(v, padrao) {\n  if (v === undefined || v === null || v === '') return padrao;\n  return ['1', 'true', 'sim', 'yes', 'on'].includes(String(v).trim().toLowerCase());\n}\nfunction int(v, padrao) {\n  const n = parseInt(v, 10);\n  return Number.isFinite(n) ? n : padrao;\n}\nfunction lista(v, padrao) {\n  if (v === undefined || v === null || String(v).trim() === '') return padrao;\n  return String(v).split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);\n}\n\n/**\n * @param {Record<string,string|undefined>} env  ex.: process.env ou $env do n8n\n */\nfunction lerConfig(env = {}) {\n  return {\n    tz: env.TZ || 'America/Sao_Paulo',\n    canais: {\n      telegram: bool(env.CANAL_TELEGRAM_ATIVO, true),\n      whatsapp: bool(env.CANAL_WHATSAPP_ATIVO, false),   // Fase 5\n      email: bool(env.CANAL_EMAIL_ATIVO, false),         // entrada por e-mail: Fase 3\n      forms: bool(env.CANAL_FORMS_ATIVO, false),         // Fase 3\n    },\n    notificacoes: {\n      telegram: bool(env.NOTIFICACAO_TELEGRAM_ATIVA, true),\n      whatsapp: bool(env.NOTIFICACAO_WHATSAPP_ATIVA, false),\n      email: bool(env.NOTIFICACAO_EMAIL_ATIVA, true),\n    },\n    features: {\n      rodizio: bool(env.FEATURE_RODIZIO, true),\n      reversao: bool(env.FEATURE_REVERSAO, true),\n      drive: bool(env.FEATURE_DRIVE, true),\n      fluxograma: bool(env.FEATURE_FLUXOGRAMA, true),       // imagem do fluxo em /projeto e /fluxograma\n      iaDocumentos: bool(env.FEATURE_IA_DOCUMENTOS, false), // Fase 4\n      // TODO(ENVIO_AUTOMATICO_CLIENTE): quando implementado, o efeito `enviar_documento_cliente` usa esta flag.\n      envioAutomaticoCliente: bool(env.ENVIO_AUTOMATICO_CLIENTE, false),\n    },\n    sla: {\n      lembreteIntervaloHoras: int(env.LEMBRETE_INTERVALO_HORAS, 24),\n      escalonarAposLembretes: int(env.ESCALONAR_APOS_LEMBRETES, 2),\n      diasAutoAbandono: int(env.DIAS_AUTO_ABANDONO, 30),\n      horarioInicio: env.HORARIO_NOTIFICACAO_INICIO || '08:00',\n      horarioFim: env.HORARIO_NOTIFICACAO_FIM || '21:00',\n      notificarFimDeSemana: bool(env.NOTIFICAR_FIM_DE_SEMANA, false),\n      tz: env.TZ || 'America/Sao_Paulo',\n    },\n    exigirResponsavelAtribuido: bool(env.EXIGIR_RESPONSAVEL_ATRIBUIDO, false),\n    sync: {\n      cron: env.SYNC_MEMBROS_CRON || '*/15 * * * *',\n      planilhaId: env.SHEETS_MEMBROS_ID || '',\n      aba: env.SHEETS_MEMBROS_ABA || '',          // vazio = ano atual\n      maxDesativacoes: int(env.SYNC_MAX_DESATIVACOES, 5),\n      maxDesativacoesPct: int(env.SYNC_MAX_DESATIVACOES_PCT, 20),\n      mapaDiretorias: env.SYNC_MAPA_DIRETORIAS || '',\n    },\n    fluxoMostrarRevertidas: bool(env.FLUXO_MOSTRAR_REVERTIDAS, true),\n    krokiUrl: (env.KROKI_URL || 'http://kroki:8000').replace(/\\/+$/, ''),\n    janelaReversaoHoras: int(env.JANELA_REVERSAO_HORAS, 48),\n    sessaoTtlMin: int(env.SESSAO_TTL_MIN, 30),\n    rateLimitPorMin: int(env.RATE_LIMIT_POR_MIN, 20),\n    arquivoTamanhoMaxMb: int(env.ARQUIVO_TAMANHO_MAX_MB, 20),\n    arquivoExtensoes: lista(env.ARQUIVO_EXTENSOES_PERMITIDAS,\n      ['pdf', 'png', 'jpg', 'jpeg', 'docx', 'xlsx', 'zip', 'stl', '3mf', 'step']),\n    driveRaizId: env.DRIVE_RAIZ_ID || '',\n    emailRemetente: env.EMAIL_REMETENTE || 'Therion Bot <fluxo@example.com>',\n    telegramApiBase: (env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\\/+$/, ''),\n  };\n}\n\nmodule.exports = { lerConfig };\n\n};\n__mods['./render'] = function (module, exports, require) {\n'use strict';\n/**\n * Renderização por canal: transforma mensagens neutras em \"envios\" prontos para o WF-05.\n *   telegram -> { canal:'telegram', membro_id, registrar, telegram: { metodo, corpo } }   (Bot API)\n *   email    -> { canal:'email',    membro_id, registrar, email: { para, assunto, texto } }\n */\n\nconst LIMITE_TELEGRAM = 4096;\n\n/** Quebra um texto longo em partes de até `limite`, preferindo quebras de linha. */\nfunction dividirTexto(texto, limite = LIMITE_TELEGRAM) {\n  const partes = [];\n  let resto = String(texto ?? '');\n  while (resto.length > limite) {\n    let corte = resto.lastIndexOf('\\n', limite);\n    if (corte < limite / 2) corte = limite;\n    partes.push(resto.slice(0, corte));\n    resto = resto.slice(corte).replace(/^\\n/, '');\n  }\n  if (resto || !partes.length) partes.push(resto);\n  return partes;\n}\n\n/** Só notificações vão para a tabela `notificacoes`; respostas diretas e mensagens sigilosas (código de vínculo) não. */\nfunction deveRegistrar(msg) { return !msg.resposta_direta && !msg.sigiloso; }\n\nfunction tecladoTelegram(botoes) {\n  if (!botoes || !botoes.length) return undefined;\n  return {\n    inline_keyboard: botoes.map((b) => [{\n      text: String(b.rotulo).slice(0, 60),\n      callback_data: String(b.dados).slice(0, 64),   // limite da Bot API\n    }]),\n  };\n}\n\n/**\n * Imagem (fluxograma): o WF-05 renderiza `imagem.fonte` no Kroki e envia com sendPhoto\n * (multipart). Vai ANTES do texto, para os botões ficarem na última mensagem.\n */\nfunction renderImagemTelegram(msg) {\n  const im = msg.imagem;\n  return {\n    canal: 'telegram', membro_id: msg.membro_id || null, registrar: false,\n    imagem: { tipo: im.tipo || 'graphviz', fonte: im.fonte, arquivo: im.arquivo || 'fluxograma.png' },\n    telegram: { metodo: 'sendPhoto', corpo: { chat_id: msg.destino, caption: String(im.legenda || '').slice(0, 1024) } },\n  };\n}\n\nfunction renderTelegram(msg) {\n  const partes = dividirTexto(msg.texto || ' ');\n  const imagem = msg.imagem && msg.imagem.fonte ? [renderImagemTelegram(msg)] : [];\n  return imagem.concat(partes.map((texto, i) => {\n    const corpo = { chat_id: msg.destino, text: texto || ' ', disable_web_page_preview: true };\n    const teclado = i === partes.length - 1 ? tecladoTelegram(msg.botoes) : undefined;\n    if (teclado) corpo.reply_markup = teclado;\n    return { canal: 'telegram', membro_id: msg.membro_id || null, registrar: deveRegistrar(msg), telegram: { metodo: 'sendMessage', corpo } };\n  }));\n}\n\nfunction renderEmail(msg) {\n  let texto = msg.texto || '';\n  if (msg.botoes && msg.botoes.length) texto += '\\n\\nPara agir, use o bot no Telegram.';\n  return [{\n    canal: 'email', membro_id: msg.membro_id || null, registrar: deveRegistrar(msg),\n    // essencial = sai mesmo com NOTIFICACAO_EMAIL_ATIVA=false (ex.: código de vínculo, que só existe por e-mail)\n    essencial: !!msg.sigiloso,\n    email: { para: msg.destino, assunto: msg.assunto || 'Therion Fluxo', texto },\n  }];\n}\n\n/**\n * @param {object[]} mensagens  [{canal, destino, texto, botoes?, assunto?, membro_id?}]\n * @param {{id:string}|null} callback  se a entrada foi um clique de botão, responde-o (tira o \"carregando\")\n */\nfunction montarEnvios(mensagens, callback = null) {\n  const envios = [];\n  if (callback && callback.id) {\n    envios.push({ canal: 'telegram', membro_id: null, registrar: false,\n      telegram: { metodo: 'answerCallbackQuery', corpo: { callback_query_id: callback.id } } });\n  }\n  for (const m of mensagens || []) {\n    if (!m || !m.destino) continue;\n    if (m.canal === 'telegram') envios.push(...renderTelegram(m));\n    else if (m.canal === 'email') envios.push(...renderEmail(m));\n  }\n  return envios;\n}\n\nmodule.exports = { montarEnvios, renderTelegram, renderImagemTelegram, renderEmail, dividirTexto, tecladoTelegram, LIMITE_TELEGRAM };\n\n};\n// ==== Fim dos módulos embutidos. Código do nó: ====\nconst { mensagens, callback } = $input.first().json;\nconst cfg = __req('./config').lerConfig($env);\nconst envios = __req('./render').montarEnvios(mensagens || [], callback || null)\n  // respeita as chaves gerais de notificação; respostas diretas no Telegram e e-mails essenciais\n  // (código de vínculo) sempre saem\n  .filter((e) => (e.canal === 'email' ? cfg.notificacoes.email || e.essencial : true));\nreturn envios.map((e) => ({ json: e }));"
       },
       "id": "a2024164-1c23-41be-aaac-7663ec8823fb",
       "position": [
@@ -65,6 +65,124 @@
       ]
     },
     {
+      "name": "É imagem?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-É imagem?",
+              "leftValue": "={{ !!$json.imagem }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "id": "f6332219-0a8b-4595-acbc-6c2eafc1ecda",
+      "position": [
+        720,
+        0
+      ]
+    },
+    {
+      "name": "Renderizar (Kroki)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.KROKI_URL || 'http://kroki:8000').replace(/\\/+$/, '') }}/",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ diagram_source: $json.imagem.fonte, diagram_type: $json.imagem.tipo || 'graphviz', output_format: 'png' }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "98f9017a-6f54-4ff3-a474-961ec968717a",
+      "position": [
+        960,
+        0
+      ]
+    },
+    {
+      "name": "Enviar foto",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\\/+$/, '') }}/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendPhoto",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "chat_id",
+              "value": "={{ $('Montar envios').item.json.telegram.corpo.chat_id }}"
+            },
+            {
+              "name": "caption",
+              "value": "={{ $('Montar envios').item.json.telegram.corpo.caption }}"
+            },
+            {
+              "parameterType": "formBinaryData",
+              "name": "photo",
+              "inputDataFieldName": "data"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "22deef99-9ec8-458a-aa0c-1171a0e0ae23",
+      "position": [
+        1200,
+        0
+      ]
+    },
+    {
+      "name": "Resultado imagem",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "parameters": {
+        "jsCode": "// Falha no Kroki ou no Telegram não impede o texto (que segue no outro ramo).\nconst r = $json || {};\nreturn { json: { registrar: false, membro_id: null, canal: 'telegram', payload: { metodo: 'sendPhoto' },\n  ok: r.ok === true, erro: r.ok === true ? null : String(r.description || (r.error && (r.error.message || r.error)) || 'falha ao gerar/enviar a imagem') } };",
+        "mode": "runOnceForEachItem"
+      },
+      "id": "ee4216ca-9f1a-4f52-ab65-79484d63d832",
+      "position": [
+        0,
+        220
+      ]
+    },
+    {
       "name": "Telegram",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
@@ -86,8 +204,8 @@
       "onError": "continueRegularOutput",
       "id": "02049370-f096-4ef6-a46b-41f60e9b2c82",
       "position": [
-        720,
-        0
+        240,
+        220
       ]
     },
     {
@@ -113,8 +231,8 @@
       },
       "id": "4dad0b21-caad-44d8-ad65-b2eac2a51973",
       "position": [
-        960,
-        0
+        480,
+        220
       ]
     },
     {
@@ -127,8 +245,8 @@
       },
       "id": "010c4ad7-c37c-4c18-a179-27b16d599d3a",
       "position": [
-        1200,
-        0
+        720,
+        220
       ]
     },
     {
@@ -141,7 +259,7 @@
       },
       "id": "c2a57930-4409-4c3d-a4da-278e9fba5876",
       "position": [
-        0,
+        960,
         220
       ]
     },
@@ -164,7 +282,7 @@
       },
       "id": "fa6be952-4c68-43cb-a60f-3eedbf0ee3b7",
       "position": [
-        240,
+        1200,
         220
       ]
     }
@@ -196,7 +314,7 @@
       "main": [
         [
           {
-            "node": "Telegram",
+            "node": "É imagem?",
             "type": "main",
             "index": 0
           }
@@ -204,6 +322,53 @@
         [
           {
             "node": "E-mail",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "É imagem?": {
+      "main": [
+        [
+          {
+            "node": "Renderizar (Kroki)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Renderizar (Kroki)": {
+      "main": [
+        [
+          {
+            "node": "Enviar foto",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Resultado imagem",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enviar foto": {
+      "main": [
+        [
+          {
+            "node": "Resultado imagem",
             "type": "main",
             "index": 0
           }

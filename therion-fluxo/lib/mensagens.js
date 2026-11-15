@@ -13,6 +13,7 @@ function resp(ok, codigo, mensagem, botoes = []) {
 
 const AJUDA = [
   'Comandos disponíveis:',
+  '/me — seus dados cadastrados',
   '/meus — projetos aguardando a sua diretoria',
   '/projetos [filtro] — todos os projetos em andamento',
   '/projeto P-AAAA-NNNN — detalhes e ações',
@@ -24,6 +25,11 @@ const AJUDA = [
   '/canal telegram|email — onde receber notificações',
   '/ausente e /disponivel — sair/voltar do rodízio',
   '/cancelar — cancelar a operação em andamento',
+].join('\n');
+
+const AJUDA_ADMIN = [
+  '/sync — prévia da planilha de membros (depois toque em Aplicar)',
+  '/sync forcar — idem, permitindo desativar muitos membros de uma vez',
 ].join('\n');
 
 const NAO_IDENTIFICADO = [
@@ -40,7 +46,7 @@ const ERROS = {
   TRANSICAO_INVALIDA: (cod) => `Esta ação não é mais possível no estado atual do projeto. Confira com /projeto ${cod || ''}.`,
   NADA_A_REVERTER: () => 'Não há nenhuma ação para reverter neste projeto.',
   PROJETO_NAO_ENCONTRADO: () => 'Projeto não encontrado. Use /projetos para ver os códigos.',
-  RESPONSAVEL_INVALIDO: () => 'O novo responsável precisa ser um membro ativo da diretoria responsável pela etapa (administradores e Presidência podem escolher qualquer membro ativo).',
+  RESPONSAVEL_INVALIDO: () => 'O novo responsável precisa ser um membro ativo da diretoria responsável pela etapa.',
   TIPO_INVALIDO: () => 'Tipo de serviço inexistente ou desativado.',
   CAMPOS_FALTANTES: () => 'Faltam informações obrigatórias.',
   VINCULO_INEXISTENTE: () => 'Não há pedido de vínculo em aberto (ou ele expirou). Envie /vincular seu.email@dominio de novo.',
@@ -118,7 +124,27 @@ function textoNotificacao(resultado, { rotulo, motivo }) {
   return linhas.join('\n');
 }
 
+/** Dados cadastrais do próprio membro (/me). */
+function perfilMembro(m) {
+  const sn = (b) => (b ? 'sim' : 'não');
+  const canais = Array.isArray(m.canais_habilitados) && m.canais_habilitados.length ? m.canais_habilitados.join(', ') : '—';
+  return [
+    '👤 Seus dados cadastrados',
+    `Nome: ${m.nome || '—'}`,
+    `Diretoria: ${nomeDiretoria(m.diretoria)}`,
+    `Cargo: ${m.cargo || '—'}`,
+    `Administrador: ${sn(m.is_admin)}`,
+    `E-mail: ${m.email || '—'}`,
+    `Telefone: ${m.telefone_e164 || '—'}`,
+    `Canal de notificação: ${m.canal_preferido || '—'} (habilitados: ${canais})`,
+    `No rodízio: ${m.disponivel === false ? 'não (ausente)' : 'sim'}`,
+    '',
+    'Algo errado? Peça à diretoria para corrigir na planilha de membros.',
+  ].join('\n');
+}
+
 module.exports = {
+  perfilMembro, AJUDA_ADMIN,
   resp, AJUDA, NAO_IDENTIFICADO, mensagemErro, rotuloAcao, linhaProjeto,
   formatarProjeto, formatarHistorico, textoNotificacao,
 };

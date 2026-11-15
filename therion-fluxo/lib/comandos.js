@@ -8,6 +8,7 @@ const { normalizar } = require('./texto');
 const ALIASES = {
   ajuda: 'ajuda', help: 'ajuda', start: 'ajuda', comandos: 'ajuda', menu: 'ajuda',
   meus: 'meus', pendentes: 'meus',
+  me: 'me', eu: 'me', perfil: 'me', cadastro: 'me',
   projetos: 'projetos', listar: 'projetos',
   projeto: 'projeto', detalhes: 'projeto',
   novo: 'novo',
@@ -19,6 +20,7 @@ const ALIASES = {
   comentar: 'comentar', reatribuir: 'reatribuir',
   canal: 'canal', ausente: 'ausente', disponivel: 'disponivel',
   vincular: 'vincular', codigo: 'codigo',
+  sync: 'sync', sincronizar: 'sync',
   cancelar: 'cancelar', nao: 'cancelar',
   confirmar: 'confirmar', confirmo: 'confirmar', sim: 'confirmar', ok: 'confirmar',
 };

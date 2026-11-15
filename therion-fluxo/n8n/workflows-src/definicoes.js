@@ -200,6 +200,12 @@ if ($env.TELEGRAM_CHAT_ADMINS) {
 return [{ json: { mensagens, callback: null } }];
 `),
     chamar('Enviar aviso (WF-05)', ID.envio),
+    code('Efeitos de sync', [], `
+// /sync (admin): dispara o WF-09, que responde a quem pediu com a prévia ou o relatório.
+const efeitos = $('Concluir').first().json.efeitos || [];
+return efeitos.filter((e) => e.tipo === 'sync_membros').map((e) => ({ json: e }));
+`),
+    chamar('Sync de membros (WF-09)', ID.syncMembros),
   ],
   connections: [
     ['Início', 'Contexto'], ['Contexto', 'Preparar'], ['Preparar', 'Dados'], ['Dados', 'Processar'],
@@ -209,6 +215,7 @@ return [{ json: { mensagens, callback: null } }];
     ['Concluir', 'Finalizar'], ['Finalizar', 'Mensagens'], ['Mensagens', 'Enviar (WF-05)'],
     // Em paralelo ao envio: se não houvesse mensagens, o WF-05 não devolveria itens e a cadeia pararia.
     ['Mensagens', 'Efeitos do Drive'], ['Efeitos do Drive', 'Drive (WF-06)'],
+    ['Mensagens', 'Efeitos de sync'], ['Efeitos de sync', 'Sync de membros (WF-09)'],
     ['Drive (WF-06)', 'Avisar falha do Drive', 1], ['Avisar falha do Drive', 'Enviar aviso (WF-05)'],
   ],
 };
@@ -264,6 +271,39 @@ const envios = __req('./render').montarEnvios(mensagens || [], callback || null)
 return envios.map((e) => ({ json: e }));
 `),
     seVerdadeiro('É Telegram?', "$json.canal === 'telegram'"),
+    // Fluxograma: fonte DOT -> PNG no Kroki (container local, nada sai da máquina) -> sendPhoto.
+    // O ramo da imagem roda antes do ramo de texto (ordem de execução v1), então a foto chega primeiro.
+    seVerdadeiro('É imagem?', "!!$json.imagem"),
+    {
+      name: 'Renderizar (Kroki)', type: 'n8n-nodes-base.httpRequest', typeVersion: 4.2, onError: 'continueErrorOutput',
+      parameters: {
+        method: 'POST',
+        url: "={{ ($env.KROKI_URL || 'http://kroki:8000').replace(/\\/+$/, '') }}/",
+        sendBody: true, specifyBody: 'json',
+        jsonBody: "={{ JSON.stringify({ diagram_source: $json.imagem.fonte, diagram_type: $json.imagem.tipo || 'graphviz', output_format: 'png' }) }}",
+        options: { response: { response: { responseFormat: 'file', outputPropertyName: 'data' } }, timeout: 30000 },
+      },
+    },
+    {
+      name: 'Enviar foto', type: 'n8n-nodes-base.httpRequest', typeVersion: 4.2, onError: 'continueRegularOutput',
+      parameters: {
+        method: 'POST',
+        url: "={{ ($env.TELEGRAM_API_BASE || 'https://api.telegram.org').replace(/\\/+$/, '') }}/bot{{ $env.TELEGRAM_BOT_TOKEN }}/sendPhoto",
+        sendBody: true, contentType: 'multipart-form-data',
+        bodyParameters: { parameters: [
+          { name: 'chat_id', value: "={{ $('Montar envios').item.json.telegram.corpo.chat_id }}" },
+          { name: 'caption', value: "={{ $('Montar envios').item.json.telegram.corpo.caption }}" },
+          { parameterType: 'formBinaryData', name: 'photo', inputDataFieldName: 'data' },
+        ] },
+        options: { response: { response: { neverError: true } }, timeout: 30000 },
+      },
+    },
+    code('Resultado imagem', [], `
+// Falha no Kroki ou no Telegram não impede o texto (que segue no outro ramo).
+const r = $json || {};
+return { json: { registrar: false, membro_id: null, canal: 'telegram', payload: { metodo: 'sendPhoto' },
+  ok: r.ok === true, erro: r.ok === true ? null : String(r.description || (r.error && (r.error.message || r.error)) || 'falha ao gerar/enviar a imagem') } };
+`, { porItem: true }),
     telegramHttp('Telegram', '$json.telegram.metodo', '$json.telegram.corpo', { onError: 'continueRegularOutput' }),
     {
       name: 'E-mail', type: 'n8n-nodes-base.emailSend', typeVersion: 2.1, credentials: CRED_SMTP, onError: 'continueRegularOutput',
@@ -292,7 +332,10 @@ return { json: { registrar: !!envio.registrar, membro_id: envio.membro_id, canal
   ],
   connections: [
     ['Início', 'Montar envios'], ['Montar envios', 'É Telegram?'],
-    ['É Telegram?', 'Telegram', 0], ['É Telegram?', 'E-mail', 1],
+    ['É Telegram?', 'É imagem?', 0], ['É Telegram?', 'E-mail', 1],
+    ['É imagem?', 'Renderizar (Kroki)', 0], ['É imagem?', 'Telegram', 1],
+    ['Renderizar (Kroki)', 'Enviar foto', 0], ['Renderizar (Kroki)', 'Resultado imagem', 1],
+    ['Enviar foto', 'Resultado imagem'],
     ['Telegram', 'Resultado Telegram'], ['E-mail', 'Resultado E-mail'],
     ['Resultado Telegram', 'Registrar envio'], ['Resultado E-mail', 'Registrar envio'],
   ],
@@ -384,61 +427,110 @@ return [{ json: { arquivos } }];
 };
 
 // ----------------------------------------------------------------------------------- WF-09
+// Sync de membros. Lê SÓ as colunas necessárias da aba do ano (lib/membros.js#FAIXAS_PLANILHA) via
+// values:batchGet com a service account (escopo spreadsheets.readonly): CPF, RG, endereço, nascimento
+// e R.A. nunca saem do Google nem ficam no log de execuções do n8n. A planilha continua privada.
+// Gatilhos: cron (SYNC_MEMBROS_CRON) e sub-workflow (/sync, vindo do WF-03 com simular/forcar/solicitante).
 const wf09 = {
   id: ID.syncMembros, name: 'WF-09 Sync de Membros', active: true,
   nodes: [
-    { name: 'A cada 15 minutos', type: 'n8n-nodes-base.scheduleTrigger', typeVersion: 1.2, parameters: { rule: { interval: [{ field: 'minutes', minutesInterval: 15 }] } } },
+    { name: 'Agendado', type: 'n8n-nodes-base.scheduleTrigger', typeVersion: 1.2,
+      parameters: { rule: { interval: [{ field: 'cronExpression', expression: "={{ $env.SYNC_MEMBROS_CRON || '*/15 * * * *' }}" }] } } },
+    gatilhoSub('Pedido /sync'),
+    code('Parâmetros', ['config', 'membros'], `
+const j = $input.first().json || {};
+const pedido = j.tipo === 'sync_membros' ? j : null;      // vindo do /sync; senão é o cron
+const cfg = __req('./config').lerConfig($env);
+const m = __req('./membros');
+const aba = m.abaMembros($env);
+const solicitante = pedido ? pedido.solicitante : null;
+if (!cfg.sync.planilhaId) {
+  if (!solicitante) return [];                             // cron sem planilha configurada: nada a fazer
+  return [{ json: { configurado: false, solicitante, aba } }];
+}
+const faixas = m.faixasBatchGet(aba).map((f) => 'ranges=' + encodeURIComponent(f)).join('&');
+return [{ json: { configurado: true, aba, solicitante,
+  simular: pedido ? pedido.simular !== false : false, forcar: !!(pedido && pedido.forcar),
+  url: 'https://sheets.googleapis.com/v4/spreadsheets/' + encodeURIComponent(cfg.sync.planilhaId)
+    + '/values:batchGet?' + faixas + '&majorDimension=ROWS&valueRenderOption=FORMATTED_VALUE' } }];
+`),
+    seVerdadeiro('Planilha configurada?', '$json.configurado'),
     {
-      name: 'Ler planilha', type: 'n8n-nodes-base.googleSheets', typeVersion: 4.5, credentials: CRED_SHEETS, alwaysOutputData: true,
+      name: 'Ler colunas (batchGet)', type: 'n8n-nodes-base.httpRequest', typeVersion: 4.2, credentials: CRED_SHEETS,
+      onError: 'continueErrorOutput',
       parameters: {
-        authentication: 'serviceAccount', resource: 'sheet', operation: 'read',
-        documentId: { __rl: true, mode: 'id', value: '={{ $env.SHEETS_MEMBROS_ID }}' },
-        sheetName: { __rl: true, mode: 'name', value: "={{ $env.SHEETS_MEMBROS_ABA || 'Membros' }}" },
-        options: {},
+        method: 'GET', url: '={{ $json.url }}',
+        authentication: 'predefinedCredentialType', nodeCredentialType: 'googleApi',
+        options: { timeout: 30000 },
       },
     },
-    code('Validar linhas', ['membros'], `
-const linhas = $input.all().map((i) => i.json);
-const { validas, erros } = __req('./membros').validarLinhas(linhas);
-return [{ json: { linhas: validas, erros } }];
+    code('Validar linhas', ['membros', 'config'], `
+const p = $('Parâmetros').first().json;
+const cfg = __req('./config').lerConfig($env);
+const m = __req('./membros');
+const faixas = (($input.first().json.valueRanges) || []).map((v) => v.values || []);
+const { validas, erros, preservar } = m.validarLinhas(m.montarLinhas(faixas), { mapaDiretorias: cfg.sync.mapaDiretorias });
+return [{ json: { erros, payload: { linhas: validas, preservar, simular: p.simular, forcar: p.forcar,
+  max_desativacoes: cfg.sync.maxDesativacoes, max_desativacoes_pct: cfg.sync.maxDesativacoesPct } } }];
 `),
-    // Planilha vazia/ilegível => sync_membros devolve PLANILHA_VAZIA e não desativa ninguém.
-    sql('Aplicar sync', 'sync_membros', `{ linhas: $json.linhas }`),
-    code('Relatório', ['notificacoes', 'config', 'mensagens'], `
+    // Planilha vazia/ilegível => PLANILHA_VAZIA; desativações demais => DESATIVACAO_EM_MASSA. Nos dois, nada muda.
+    sql('Aplicar sync', 'sync_membros', `$json.payload`),
+    code('Relatório', ['notificacoes', 'config', 'mensagens', 'membros'], `
 const r = $input.first().json.r;
+const p = $('Parâmetros').first().json;
 const errosPlanilha = $('Validar linhas').first().json.erros || [];
 const cfg = __req('./config').lerConfig($env);
 const { resolverCanal, montarNotificacoes } = __req('./notificacoes');
+const rel = __req('./membros').relatorioSync(r, errosPlanilha, { aba: p.aba, forcar: p.forcar });
 const mensagens = [];
-if (r.ok) {
+const sol = p.solicitante;
+if (sol) mensagens.push({ canal: sol.canal, destino: sol.destino, membro_id: sol.membro_id, resposta_direta: true, texto: rel.texto, botoes: rel.botoes });
+if (r.ok && !r.simulado) {
   for (const n of r.novos || []) {
+    if (n.reativado) continue;
     mensagens.push({ canal: 'email', destino: n.email, assunto: 'Bem-vindo(a) ao Therion Fluxo',
       texto: 'Olá, ' + n.nome + '!\\n\\nVocê foi cadastrado(a) no sistema de fluxo de projetos da EJ.\\n'
         + 'Para usar pelo Telegram, abra o bot e envie:  /vincular ' + n.email + '\\n' });
   }
-  // quem recebeu etapas por reatribuição automática
   for (const x of r.reatribuicoes || []) if (x.ok) mensagens.push(...montarNotificacoes(x, { rotulo: 'Trocar responsável' }, cfg));
 }
-const linhas = [];
-if (!r.ok) linhas.push('Sync NÃO aplicado: ' + r.codigo + ' (a planilha está vazia ou ilegível?)');
-for (const e of errosPlanilha) linhas.push('Linha ' + e.linha + ' (' + (e.email || 'sem e-mail') + '): ' + e.erro);
-for (const e of (r.erros || [])) linhas.push((e.email || '?') + ': ' + e.erro);
-for (const d of (r.desativados || [])) linhas.push('Desativado: ' + d.nome);
-if (linhas.length) {
-  const texto = '👥 Sync de membros\\n' + linhas.join('\\n');
+// Admins são avisados de syncs aplicados com mudanças (sempre que alguém ganha/perde admin) e de bloqueios do cron.
+const avisarAdmins = r.ok ? (!r.simulado && rel.houveMudanca) : !sol;
+if (avisarAdmins) {
   for (const a of (r.admins || [])) {
+    if (sol && String(a.membro_id) === String(sol.membro_id)) continue;
     const canal = resolverCanal(a, cfg);
-    if (canal) mensagens.push({ membro_id: a.membro_id, canal, destino: canal === 'telegram' ? String(a.telegram_user_id) : a.email, assunto: 'Sync de membros', texto });
+    if (canal) mensagens.push({ membro_id: a.membro_id, canal, destino: canal === 'telegram' ? String(a.telegram_user_id) : a.email, assunto: 'Sync de membros', texto: rel.texto });
   }
-  if (!r.ok && $env.TELEGRAM_CHAT_ADMINS) mensagens.push({ canal: 'telegram', destino: String($env.TELEGRAM_CHAT_ADMINS), resposta_direta: true, texto });
+  if (!r.ok && $env.TELEGRAM_CHAT_ADMINS) mensagens.push({ canal: 'telegram', destino: String($env.TELEGRAM_CHAT_ADMINS), resposta_direta: true, texto: rel.texto });
 }
 return mensagens.length ? [{ json: { mensagens, callback: null } }] : [];
+`),
+    code('Falha de leitura', [], `
+// Aba inexistente, planilha não compartilhada com a service account, credencial inválida...
+const p = $('Parâmetros').first().json;
+const e = $input.first().json.error || {};
+const detalhe = String(e.message || e.description || e || '').slice(0, 200);
+const texto = '⚠️ Não consegui ler a planilha de membros (aba "' + p.aba + '"). Nada foi alterado.\\n'
+  + 'Confira se a aba existe e se a planilha está compartilhada (Leitor) com a service account.\\n' + detalhe;
+const mensagens = [];
+if (p.solicitante) mensagens.push({ canal: p.solicitante.canal, destino: p.solicitante.destino, resposta_direta: true, texto });
+if ($env.TELEGRAM_CHAT_ADMINS) mensagens.push({ canal: 'telegram', destino: String($env.TELEGRAM_CHAT_ADMINS), resposta_direta: true, texto });
+return mensagens.length ? [{ json: { mensagens, callback: null } }] : [];
+`),
+    code('Não configurada', [], `
+const p = $input.first().json;
+return [{ json: { callback: null, mensagens: [{ canal: p.solicitante.canal, destino: p.solicitante.destino, resposta_direta: true,
+  texto: 'A planilha de membros não está configurada (SHEETS_MEMBROS_ID). Veja docs/runbook.md.' }] } }];
 `),
     chamar('Enviar (WF-05)', ID.envio),
   ],
   connections: [
-    ['A cada 15 minutos', 'Ler planilha'], ['Ler planilha', 'Validar linhas'], ['Validar linhas', 'Aplicar sync'],
-    ['Aplicar sync', 'Relatório'], ['Relatório', 'Enviar (WF-05)'],
+    ['Agendado', 'Parâmetros'], ['Pedido /sync', 'Parâmetros'], ['Parâmetros', 'Planilha configurada?'],
+    ['Planilha configurada?', 'Ler colunas (batchGet)', 0], ['Planilha configurada?', 'Não configurada', 1],
+    ['Ler colunas (batchGet)', 'Validar linhas', 0], ['Ler colunas (batchGet)', 'Falha de leitura', 1],
+    ['Validar linhas', 'Aplicar sync'], ['Aplicar sync', 'Relatório'],
+    ['Relatório', 'Enviar (WF-05)'], ['Falha de leitura', 'Enviar (WF-05)'], ['Não configurada', 'Enviar (WF-05)'],
   ],
 };
 

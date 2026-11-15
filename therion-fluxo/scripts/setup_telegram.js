@@ -28,6 +28,7 @@ async function api(metodo, corpo) {
     drop_pending_updates: true,
   });
   await api('setMyCommands', { commands: [
+    { command: 'me', description: 'Meus dados cadastrados' },
     { command: 'meus', description: 'Projetos aguardando a minha diretoria' },
     { command: 'projetos', description: 'Todos os projetos em andamento' },
     { command: 'projeto', description: 'Detalhes e ações de um projeto' },

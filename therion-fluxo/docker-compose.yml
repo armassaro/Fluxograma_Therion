@@ -31,6 +31,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      kroki:
+        condition: service_started
     env_file: .env                 # flags e segredos lidos pelos workflows via $env
     environment:
       # dados internos do n8n no mesmo Postgres, banco "n8n"
@@ -58,6 +60,15 @@ services:
       - ./n8n/workflows:/workflows:ro,z
     ports:
       - "${N8N_BIND:-127.0.0.1}:5678:5678"
+
+  # Renderizador de diagramas (fluxograma do projeto: DOT -> PNG). Só na rede interna do Compose;
+  # nenhum dado de projeto sai da máquina. O n8n chama http://kroki:8000 (KROKI_URL).
+  kroki:
+    image: yuzutech/kroki:0.28.0
+    restart: unless-stopped
+    environment:
+      KROKI_SAFE_MODE: secure
+      KROKI_MAX_URI_LENGTH: "8192"
 
   cloudflared:
     image: cloudflare/cloudflared:latest

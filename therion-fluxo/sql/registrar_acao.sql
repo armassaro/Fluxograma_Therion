@@ -321,9 +321,9 @@ BEGIN
     v_resp := nullif(v_dados->>'novo_responsavel_id', '')::uuid;
     IF v_resp IS NULL THEN
       v_resp := _proximo_rodizio(v_etapa.chave, v_etapa.diretoria_responsavel);  -- pode ser NULL: ninguém disponível
-    -- Admin/Presidência podem designar qualquer membro ativo; a diretoria, só alguém dela.
+    -- O novo responsável é sempre um membro ativo da diretoria responsável pela etapa.
     ELSIF NOT EXISTS (SELECT 1 FROM membros WHERE id = v_resp AND ativo AND NOT is_sistema
-                         AND (v_super OR diretoria = v_etapa.diretoria_responsavel)) THEN
+                         AND diretoria = v_etapa.diretoria_responsavel) THEN
       RETURN _erro('RESPONSAVEL_INVALIDO');
     END IF;
     UPDATE etapas SET responsavel_atribuido_id = v_resp WHERE id = v_etapa.id;
@@ -360,7 +360,7 @@ BEGIN
      WHERE t->>'acao' = v_tipo AND t->'de' ? v_etapa.chave LIMIT 1;
     IF v_trans IS NULL OR v_proj.status <> 'ativo' THEN RETURN _erro('TRANSICAO_INVALIDA'); END IF;
     IF NOT (v_super OR v_m.diretoria = v_etapa.diretoria_responsavel
-            OR v_m.id = v_etapa.responsavel_atribuido_id) THEN RETURN _erro('NAO_AUTORIZADO'); END IF;
+            OR coalesce(v_m.id = v_etapa.responsavel_atribuido_id, false)) THEN RETURN _erro('NAO_AUTORIZADO'); END IF;
     v_para := v_trans->>'para';
     v_efeitos := coalesce(v_trans->'efeitos', '[]'::jsonb);
     IF v_para <> v_etapa.chave THEN            -- self-loop (ex.: registrar_parcela) não troca de etapa
@@ -492,18 +492,20 @@ BEGIN
           LEFT JOIN etapas eo ON eo.id = a.etapa_origem_id
           LEFT JOIN etapas ed ON ed.id = a.etapa_destino_id
           WHERE a.projeto_id = v_proj.id),
+        -- Passagens pelas etapas (com responsável), para o fluxograma visual.
+        'etapas', (
+          SELECT coalesce(jsonb_agg(jsonb_build_object(
+                     'chave', e.chave, 'nome', e.nome, 'diretoria', e.diretoria_responsavel,
+                     'responsavel_nome', r.nome, 'data_entrada', e.data_entrada,
+                     'data_saida', e.data_saida, 'prazo_sla', e.prazo_sla) ORDER BY e.data_entrada), '[]'::jsonb)
+          FROM etapas e
+          LEFT JOIN membros r ON r.id = e.responsavel_atribuido_id
+          WHERE e.projeto_id = v_proj.id),
         'membros_diretoria', (
           SELECT coalesce(jsonb_agg(jsonb_build_object('id', m.id, 'nome', m.nome, 'email', m.email,
                      'disponivel', m.disponivel) ORDER BY m.nome_ordenacao COLLATE "C"), '[]'::jsonb)
           FROM membros m
-          WHERE m.diretoria = v_etapa.diretoria_responsavel AND m.ativo AND NOT m.is_sistema),
-        -- Candidatos quando um admin/Presidência designa responsável fora da diretoria.
-        'membros_ativos', (
-          SELECT coalesce(jsonb_agg(jsonb_build_object('id', m.id, 'nome', m.nome, 'email', m.email,
-                     'diretoria', m.diretoria, 'disponivel', m.disponivel)
-                     ORDER BY m.nome_ordenacao COLLATE "C"), '[]'::jsonb)
-          FROM membros m
-          WHERE m.ativo AND NOT m.is_sistema));
+          WHERE m.diretoria = v_etapa.diretoria_responsavel AND m.ativo AND NOT m.is_sistema));
     END IF;
   END IF;
   RETURN v_out;
@@ -605,45 +607,68 @@ END $$;
 
 -- ----------------------------------------------------------------------------- sync_membros
 -- Aplica as linhas já validadas da planilha (lib/membros.js#validarLinhas).
--- Entrada: { linhas: [{nome, nome_ordenacao, email, telefone_e164, diretoria, cargo, is_admin,
---            ativo, disponivel, canal_preferido, canais_habilitados[]}] }
--- telegram_user_id nunca é tocado; canal_preferido só é definido na criação do membro.
-CREATE OR REPLACE FUNCTION sync_membros(p jsonb) RETURNS jsonb
+-- Entrada: { linhas: [{nome, nome_ordenacao, email, telefone_e164, diretoria|null, cargo, is_admin, ativo,
+--                      disponivel?, canal_preferido?, canais_habilitados?}],
+--            preservar?: [emails],         -- linhas com erro: não desativar por ausência
+--            simular?: bool,               -- calcula o relatório e desfaz tudo
+--            forcar?: bool,                -- passa da trava de desativação em massa
+--            max_desativacoes?: int, max_desativacoes_pct?: int }
+-- telegram_user_id nunca é tocado. disponivel/canal_preferido/canais_habilitados são do app
+-- (/ausente, /canal) e só mudam se vierem na linha.
+CREATE OR REPLACE FUNCTION _sync_membros_aplicar(p jsonb) RETURNS jsonb
 LANGUAGE plpgsql AS $$
 DECLARE
   v_l jsonb; v_m membros; v_bot uuid; v_e record; v_r jsonb;
   v_novos jsonb := '[]'; v_desativados jsonb := '[]'; v_erros jsonb := '[]'; v_reatr jsonb := '[]';
-  v_emails text[];
+  v_admins_alt jsonb := '[]'; v_ignorados jsonb := '[]';
+  v_emails text[]; v_preservar text[]; v_ativos_antes int; v_ativo boolean; v_admin boolean;
+  v_max int := coalesce((p->>'max_desativacoes')::int, 5);
+  v_pct int := coalesce((p->>'max_desativacoes_pct')::int, 20);
+  v_qtd int;
 BEGIN
-  IF jsonb_typeof(p->'linhas') <> 'array' OR jsonb_array_length(p->'linhas') = 0 THEN
-    RETURN _erro('PLANILHA_VAZIA');   -- proteção: planilha vazia/ilegível não desativa ninguém
-  END IF;
+  SELECT count(*) INTO v_ativos_antes FROM membros WHERE ativo AND NOT is_sistema;
   SELECT array_agg(lower(l->>'email')) INTO v_emails FROM jsonb_array_elements(p->'linhas') l;
+  SELECT coalesce(array_agg(lower(x)), '{}') INTO v_preservar FROM jsonb_array_elements_text(coalesce(p->'preservar', '[]')) x;
 
   FOR v_l IN SELECT * FROM jsonb_array_elements(p->'linhas') LOOP
+    v_ativo := coalesce((v_l->>'ativo')::boolean, true);
+    v_admin := coalesce((v_l->>'is_admin')::boolean, false);
     BEGIN
       SELECT * INTO v_m FROM membros WHERE email = lower(v_l->>'email');
       IF NOT FOUND THEN
+        IF NOT v_ativo THEN   -- egresso que nunca usou o sistema: não cria
+          v_ignorados := v_ignorados || jsonb_build_object('nome', v_l->>'nome', 'email', lower(v_l->>'email'));
+          CONTINUE;
+        END IF;
         INSERT INTO membros (nome, nome_ordenacao, email, telefone_e164, diretoria, cargo, is_admin, ativo,
                              disponivel, canal_preferido, canais_habilitados, sincronizado_em)
         VALUES (v_l->>'nome', v_l->>'nome_ordenacao', lower(v_l->>'email'), nullif(v_l->>'telefone_e164', ''),
-                (v_l->>'diretoria')::diretoria_t, v_l->>'cargo', (v_l->>'is_admin')::boolean,
-                (v_l->>'ativo')::boolean, (v_l->>'disponivel')::boolean,
-                (v_l->>'canal_preferido')::canal_t,
-                ARRAY(SELECT jsonb_array_elements_text(v_l->'canais_habilitados'))::canal_t[], now());
-        IF (v_l->>'ativo')::boolean THEN
-          v_novos := v_novos || jsonb_build_object('nome', v_l->>'nome', 'email', lower(v_l->>'email'));
+                (v_l->>'diretoria')::diretoria_t, coalesce(v_l->>'cargo', 'membro'), v_admin, true,
+                coalesce((v_l->>'disponivel')::boolean, true),
+                coalesce((v_l->>'canal_preferido')::canal_t, 'telegram'),
+                CASE WHEN v_l ? 'canais_habilitados'
+                     THEN ARRAY(SELECT jsonb_array_elements_text(v_l->'canais_habilitados'))::canal_t[]
+                     ELSE '{email,telegram}'::canal_t[] END, now());
+        v_novos := v_novos || jsonb_build_object('nome', v_l->>'nome', 'email', lower(v_l->>'email'));
+        IF v_admin THEN
+          v_admins_alt := v_admins_alt || jsonb_build_object('nome', v_l->>'nome', 'email', lower(v_l->>'email'), 'admin', true);
         END IF;
       ELSIF NOT v_m.is_sistema THEN
         UPDATE membros SET
           nome = v_l->>'nome', nome_ordenacao = v_l->>'nome_ordenacao',
           telefone_e164 = nullif(v_l->>'telefone_e164', ''),
-          diretoria = (v_l->>'diretoria')::diretoria_t, cargo = v_l->>'cargo',
-          is_admin = (v_l->>'is_admin')::boolean, ativo = (v_l->>'ativo')::boolean,
-          disponivel = (v_l->>'disponivel')::boolean, sincronizado_em = now()
+          diretoria = coalesce((v_l->>'diretoria')::diretoria_t, diretoria),
+          cargo = coalesce(v_l->>'cargo', cargo), is_admin = v_admin, ativo = v_ativo,
+          disponivel = CASE WHEN v_l ? 'disponivel' THEN (v_l->>'disponivel')::boolean ELSE disponivel END,
+          sincronizado_em = now()
         WHERE id = v_m.id;
-        IF v_m.ativo AND NOT (v_l->>'ativo')::boolean THEN
-          v_desativados := v_desativados || jsonb_build_object('nome', v_m.nome, 'email', v_m.email);
+        IF v_m.ativo AND NOT v_ativo THEN
+          v_desativados := v_desativados || jsonb_build_object('nome', v_m.nome, 'email', v_m.email, 'motivo', 'egresso/saída');
+        ELSIF NOT v_m.ativo AND v_ativo THEN
+          v_novos := v_novos || jsonb_build_object('nome', v_l->>'nome', 'email', v_m.email, 'reativado', true);
+        END IF;
+        IF v_m.is_admin IS DISTINCT FROM (v_admin AND v_ativo) AND (v_m.ativo OR v_ativo) THEN
+          v_admins_alt := v_admins_alt || jsonb_build_object('nome', v_m.nome, 'email', v_m.email, 'admin', v_admin AND v_ativo);
         END IF;
       END IF;
     EXCEPTION WHEN OTHERS THEN
@@ -651,11 +676,22 @@ BEGIN
     END;
   END LOOP;
 
-  -- Quem saiu da planilha é desativado (offboarding).
+  -- Quem saiu da planilha é desativado (offboarding), exceto e-mails de linhas com erro.
   FOR v_m IN UPDATE membros SET ativo = false, sincronizado_em = now()
-              WHERE ativo AND NOT is_sistema AND NOT (email = ANY (v_emails)) RETURNING * LOOP
-    v_desativados := v_desativados || jsonb_build_object('nome', v_m.nome, 'email', v_m.email);
+              WHERE ativo AND NOT is_sistema AND NOT (email = ANY (v_emails)) AND NOT (email = ANY (v_preservar))
+              RETURNING * LOOP
+    v_desativados := v_desativados || jsonb_build_object('nome', v_m.nome, 'email', v_m.email, 'motivo', 'fora da planilha');
+    IF v_m.is_admin THEN
+      v_admins_alt := v_admins_alt || jsonb_build_object('nome', v_m.nome, 'email', v_m.email, 'admin', false);
+    END IF;
   END LOOP;
+
+  -- Trava de desativação em massa (aba errada, filtro aplicado, linhas apagadas...).
+  v_qtd := jsonb_array_length(v_desativados);
+  IF v_qtd > 1 AND (v_qtd > v_max OR v_qtd::bigint * 100 > v_pct::bigint * greatest(v_ativos_antes, 1)) THEN
+    RETURN jsonb_build_object('excedeu', true, 'qtd_desativacoes', v_qtd, 'ativos', v_ativos_antes,
+                              'desativados', v_desativados);
+  END IF;
 
   -- Etapas abertas cujo responsável ficou inativo/indisponível voltam para o rodízio.
   SELECT id INTO v_bot FROM membros WHERE is_sistema ORDER BY email LIMIT 1;
@@ -675,7 +711,39 @@ BEGIN
 
   RETURN jsonb_build_object(
     'ok', true, 'codigo', 'SYNC_CONCLUIDO', 'novos', v_novos, 'desativados', v_desativados,
-    'erros', v_erros, 'reatribuicoes', v_reatr,
+    'admins_alterados', v_admins_alt, 'ignorados', v_ignorados,
+    'erros', v_erros, 'reatribuicoes', v_reatr);
+END $$;
+
+CREATE OR REPLACE FUNCTION sync_membros(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE
+  v jsonb; v_desfeito boolean := false;
+  v_simular boolean := coalesce((p->>'simular')::boolean, false);
+  v_forcar boolean := coalesce((p->>'forcar')::boolean, false);
+BEGIN
+  IF jsonb_typeof(p->'linhas') IS DISTINCT FROM 'array' OR jsonb_array_length(p->'linhas') = 0 THEN
+    RETURN _erro('PLANILHA_VAZIA');   -- proteção: planilha vazia/ilegível não desativa ninguém
+  END IF;
+  BEGIN
+    -- `forcar` desliga a trava de desativação em massa.
+    v := _sync_membros_aplicar(CASE WHEN v_forcar
+           THEN p || jsonb_build_object('max_desativacoes', 2147483647, 'max_desativacoes_pct', 21474836)
+           ELSE p END);
+    -- Simulação, ou trava de massa disparada: desfaz tudo o que foi aplicado acima.
+    IF v_simular OR coalesce((v->>'excedeu')::boolean, false) THEN
+      RAISE EXCEPTION USING ERRCODE = 'TS001';
+    END IF;
+  EXCEPTION WHEN SQLSTATE 'TS001' THEN
+    v_desfeito := true;
+  END;
+  IF coalesce((v->>'excedeu')::boolean, false) THEN
+    RETURN _erro('DESATIVACAO_EM_MASSA') || jsonb_build_object(
+      'qtd_desativacoes', v->'qtd_desativacoes', 'ativos', v->'ativos', 'desativados', v->'desativados',
+      'simulado', v_simular);
+  END IF;
+  RETURN v || jsonb_build_object(
+    'simulado', v_simular,
     'admins', (SELECT coalesce(jsonb_agg(jsonb_build_object(
                    'membro_id', id, 'nome', nome, 'email', email, 'telegram_user_id', telegram_user_id,
                    'canal_preferido', canal_preferido, 'canais_habilitados', canais_habilitados)), '[]'::jsonb)

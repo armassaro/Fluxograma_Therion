@@ -8,7 +8,7 @@
  * Não acessa banco nem rede.
  */
 const { definicaoAcao, transicoesDisponiveis, etapaTerminal } = require('./templates');
-const { podeExecutar, ehSuper } = require('./autorizacao');
+const { podeExecutar } = require('./autorizacao');
 const { validarCampos } = require('./validacao');
 const { avaliarGuarda } = require('./guardas');
 const { fmtMoeda } = require('./texto');
@@ -35,11 +35,10 @@ function resolverCamposMembro(campos, membrosDiretoria) {
 }
 
 /**
- * Membros que podem ser escolhidos num campo `membro`: admin/Presidência reatribuindo podem
- * designar qualquer membro ativo; os demais, só membros da diretoria responsável.
+ * Membros que podem ser escolhidos num campo `membro` (ex.: novo responsável no `reatribuir`):
+ * sempre os membros ativos da diretoria responsável pela etapa atual — inclusive para admin.
  */
-function candidatosMembro(membro, tipoAcao, membrosDiretoria, membrosAtivos) {
-  if (tipoAcao === 'reatribuir' && ehSuper(membro) && Array.isArray(membrosAtivos)) return membrosAtivos;
+function candidatosMembro(membrosDiretoria) {
   return membrosDiretoria || [];
 }
 
@@ -50,7 +49,6 @@ function candidatosMembro(membro, tipoAcao, membrosDiretoria, membrosAtivos) {
  * @param {object}   ctx.template          definição do fluxo do projeto
  * @param {object[]} ctx.acoes             histórico (para guardas e reversão)
  * @param {object[]} [ctx.membrosDiretoria]
- * @param {object[]} [ctx.membrosAtivos]    todos os membros ativos (para admin reatribuir)
  * @param {string}   ctx.tipoAcao
  * @param {object}   [ctx.campos]          valores informados
  * @param {object[]} [ctx.arquivos]        [{campo, nome, ...}]
@@ -84,7 +82,7 @@ function planejarAcao(ctx) {
     return { ok: false, codigo: 'NAO_AUTORIZADO', mensagem: `${aut.motivo}\nQuem pode agir: ${aut.quemPode}.`, quemPode: aut.quemPode };
   }
 
-  const candidatos = candidatosMembro(membro, def.tipo, ctx.membrosDiretoria, ctx.membrosAtivos);
+  const candidatos = candidatosMembro(ctx.membrosDiretoria);
   const defsCampos = resolverCamposMembro(def.campos, candidatos);
   const nomesArquivo = defsCampos.filter((c) => c.tipo === 'arquivo').map((c) => c.nome);
   const arquivos = (ctx.arquivos || []).filter((a) => nomesArquivo.includes(a.campo));

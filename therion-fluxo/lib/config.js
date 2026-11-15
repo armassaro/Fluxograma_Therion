@@ -38,7 +38,7 @@ function lerConfig(env = {}) {
       rodizio: bool(env.FEATURE_RODIZIO, true),
       reversao: bool(env.FEATURE_REVERSAO, true),
       drive: bool(env.FEATURE_DRIVE, true),
-      fluxograma: bool(env.FEATURE_FLUXOGRAMA, false),      // Fase 3
+      fluxograma: bool(env.FEATURE_FLUXOGRAMA, true),       // imagem do fluxo em /projeto e /fluxograma
       iaDocumentos: bool(env.FEATURE_IA_DOCUMENTOS, false), // Fase 4
       // TODO(ENVIO_AUTOMATICO_CLIENTE): quando implementado, o efeito `enviar_documento_cliente` usa esta flag.
       envioAutomaticoCliente: bool(env.ENVIO_AUTOMATICO_CLIENTE, false),
@@ -53,6 +53,16 @@ function lerConfig(env = {}) {
       tz: env.TZ || 'America/Sao_Paulo',
     },
     exigirResponsavelAtribuido: bool(env.EXIGIR_RESPONSAVEL_ATRIBUIDO, false),
+    sync: {
+      cron: env.SYNC_MEMBROS_CRON || '*/15 * * * *',
+      planilhaId: env.SHEETS_MEMBROS_ID || '',
+      aba: env.SHEETS_MEMBROS_ABA || '',          // vazio = ano atual
+      maxDesativacoes: int(env.SYNC_MAX_DESATIVACOES, 5),
+      maxDesativacoesPct: int(env.SYNC_MAX_DESATIVACOES_PCT, 20),
+      mapaDiretorias: env.SYNC_MAPA_DIRETORIAS || '',
+    },
+    fluxoMostrarRevertidas: bool(env.FLUXO_MOSTRAR_REVERTIDAS, true),
+    krokiUrl: (env.KROKI_URL || 'http://kroki:8000').replace(/\/+$/, ''),
     janelaReversaoHoras: int(env.JANELA_REVERSAO_HORAS, 48),
     sessaoTtlMin: int(env.SESSAO_TTL_MIN, 30),
     rateLimitPorMin: int(env.RATE_LIMIT_POR_MIN, 20),

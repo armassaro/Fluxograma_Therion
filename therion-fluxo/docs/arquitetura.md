@@ -8,6 +8,7 @@ Telegram ──webhook──▶ WF-01a Entrada ──▶ WF-03 Roteador ──�
                                             │                └─▶ SQL executar_operacao → registrar_acao / criar_projeto
                                             ├─▶ finalizar_requisicao (resposta + sessão + idempotência)
                                             ├─▶ WF-05 Envio (Telegram / e-mail, outbox em `notificacoes`)
+                                            │        └─▶ Kroki (container local): fluxograma DOT → PNG → sendPhoto
                                             └─▶ WF-06 Drive (efeitos pós-commit: pasta do projeto)
 Cron ─▶ WF-09 Sync de membros (Google Sheets → sync_membros → reatribuições)
 Qualquer erro ─▶ WF-99 (alerta sem dados pessoais no grupo de admins)
@@ -38,9 +39,9 @@ Qualquer erro ─▶ WF-99 (alerta sem dados pessoais no grupo de admins)
 | therion-wf-02 | Identificação | `ctx_entrada`: membro pelo canal, sessão aberta, já processada?, rate limit |
 | therion-wf-03 | Roteador | parse, consultas, diálogo de campos, chama motor/envio/drive |
 | therion-wf-04 | Motor | upload de arquivos → `executar_operacao` |
-| therion-wf-05 | Notificações | render por canal, envio, registro em `notificacoes` |
+| therion-wf-05 | Notificações | render por canal, envio, registro em `notificacoes`; envios com `imagem` passam pelo Kroki (`KROKI_URL`) e saem como `sendPhoto` antes do texto. Se o Kroki falhar, o texto sai mesmo assim |
 | therion-wf-06 | Drive | pasta do projeto + subpastas, upload de arquivos do Telegram |
-| therion-wf-09 | Sync de membros | planilha → `sync_membros` → relatório e reatribuições |
+| therion-wf-09 | Sync de membros | cron (`SYNC_MEMBROS_CRON`) ou `/sync` → `values:batchGet` só das colunas permitidas → `validarLinhas` → `sync_membros` (prévia/trava de massa) → relatório e reatribuições |
 | therion-wf-99 | Erros | alerta para `TELEGRAM_CHAT_ADMINS` |
 
 ## Módulos de `lib/`
@@ -50,13 +51,14 @@ Qualquer erro ─▶ WF-99 (alerta sem dados pessoais no grupo de admins)
 | config | `$env` → objeto tipado (flags, regras, SLA) |
 | normalizadores | payload do canal → Comando Normalizado |
 | seguranca | `compararSegredo`, `verificarHmac`, `verificarMeta`, `rateLimit` |
-| comandos | parser tolerante (com/sem barra, acentos, aspas, código no meio) |
+| comandos | parser tolerante (com/sem barra, acentos, aspas, código no meio); `/me` (aliases `eu`, `perfil`, `cadastro`) mostra o cadastro do membro (`mensagens.perfilMembro`) |
 | templates / jsonschema | consulta e validação de fluxos (grafo + `fluxos/schema.json`) |
-| autorizacao | §8.1 — `podeExecutar` com "quem pode" na recusa; o responsável designado da etapa (mesmo de outra diretoria, quando um admin o designou via `reatribuir`) pode executar as transições dela |
+| autorizacao | §8.1 — `podeExecutar` com "quem pode" na recusa; o responsável designado da etapa pode executar as transições dela |
 | validacao | tipos de campo, dinheiro/datas pt-BR, arquivos |
 | guardas | mini-DSL sem `eval` (`soma(...) >= projeto.valor_contratado`) |
-| motor | plano da ação enviado ao SQL |
+| motor | plano da ação enviado ao SQL; `candidatosMembro` define as opções de campos `membro` (no `reatribuir`: só membros ativos da diretoria da etapa) |
 | projecao | replay de eventos |
+| fluxograma | §15 — `gerarDot` monta o fluxo do projeto em Graphviz: etapas visitadas/atual/futuras, responsável e datas de cada etapa, prazo da atual, caminho percorrido com autor e data, revertidas, e tabela com as últimas 15 ações; `pedidoImagem` anexa isso à resposta de `/projeto` e `/fluxograma` |
 | rodizio | round robin alfabético pulando indisponíveis |
 | sla | prazo com pausas, etapas vencidas, janela de notificação (usado pelo WF-10 na fase 3) |
 | codigo_projeto | `P-AAAA-NNNN` |

@@ -241,25 +241,55 @@ test('render e canais: limites do Telegram e escolha do canal', () => {
   assert.equal(fmtMoeda(1234567.5), 'R$ 1.234.567,50');
 });
 
-test('planilha de membros: normaliza cabeçalhos e rejeita linhas ruins', () => {
+test('planilha de membros (aba do ano): só colunas permitidas, egressos, admins e linhas ruins', () => {
+  const { montarLinhas, mapearDiretoria, abaMembros, faixasBatchGet, relatorioSync } = require('../../lib/membros');
   assert.equal(telefoneE164('(11) 98888-7777'), '+5511988887777');
   assert.equal(telefoneE164('+351 912 345 678'), '+351912345678');
   assert.equal(telefoneE164('123'), undefined);
-  const { validas, erros } = validarLinhas([
-    { Nome: ' Érica Alves ', 'E-mail': 'Erica@EJ.com', Diretoria: 'Projetos', Cargo: 'Diretor', 'Is Admin': 'SIM', Telefone: '11 98888-7777', 'Canal preferido': 'Telegram' },
-    { nome: 'Sem Diretoria', email: 'x@ej.com', diretoria: 'marketing' },
-    { nome: 'Duplicada', email: 'erica@ej.com', diretoria: 'projetos' },
-    { nome: '', email: '' },
-    { nome: 'Fora', email: 'fora@ej.com', diretoria: 'comercial', ativo: 'não', telefone: '999' },
-  ]);
-  assert.equal(validas.length, 2);
-  assert.deepEqual(validas[0], {
-    nome: 'Érica Alves', nome_ordenacao: 'erica alves', email: 'erica@ej.com', telefone_e164: '+5511988887777',
-    diretoria: 'projetos', cargo: 'diretor', is_admin: true, ativo: true, disponivel: true,
-    canal_preferido: 'telegram', canais_habilitados: ['email', 'telegram'],
-  });
-  assert.equal(validas[1].ativo, false); assert.equal(validas[1].telefone_e164, null);
-  assert.deepEqual(erros.map((e) => e.linha), [3, 4, 6]);
+  assert.deepEqual(faixasBatchGet('2026'), ["'2026'!A2:C", "'2026'!F2:F", "'2026'!K2:K", "'2026'!M2:N"], 'nunca lê D, E, G, H, I, J, L');
+  assert.equal(abaMembros({}, new Date('2026-06-01T12:00:00Z')), '2026');
+  assert.equal(abaMembros({ SHEETS_MEMBROS_ABA: 'Membros' }), 'Membros');
+  assert.equal(mapearDiretoria('Diretoria de Projetos'), 'projetos');
+  assert.equal(mapearDiretoria('Gestão de Pessoas'), null);
+  assert.equal(mapearDiretoria('Gestão de Pessoas', [['gestao de pessoas', 'administrativo']]), 'administrativo');
+
+  // Faixas como o batchGet devolve (células vazias no fim são omitidas).
+  const faixas = [
+    [['Érica Alves', 'erica@utfpr.edu.br', 'Erica@Therion.com'], ['Bia Lima', 'bia@utfpr.edu.br'], ['Caio Egresso', '', 'caio@therion.com'],
+     ['Duda', '', 'duda@therion.com'], ['Edu', '', 'edu@therion.com'], [''], ['Fabi', '', 'fabi@therion.com'], ['Gui', '', 'gui@therion.com']],
+    [['(11) 98888-7777'], ['999'], [], [], [], [], [], []],
+    [[], [], [], [], ['10/01/2020'], [], ['31/02/2026'], []],
+    [['Diretora de Projetos', 'Projetos'], ['Assessora', 'Comercial'], ['Egresso', 'Projetos'], ['Assessor', 'Marketing Digital'],
+     ['Assessor', 'Financeiro'], [], ['Assessor', 'Financeiro'], ['Presidente']],
+  ];
+  const linhas = montarLinhas(faixas);
+  assert.equal(linhas.length, 8);
+  assert.equal(linhas[0].linha, 2);
+  for (const l of linhas) assert.deepEqual(Object.keys(l).sort(), ['cargo', 'data_saida', 'diretoria', 'email_therion', 'email_utfpr', 'linha', 'nome', 'telefone']);
+
+  const { validas, erros, preservar } = validarLinhas(linhas, { mapaDiretorias: 'marketing digital=comercial', hoje: new Date('2026-11-14') });
+  const por = Object.fromEntries(validas.map((v) => [v.email, v]));
+  assert.deepEqual(por['erica@therion.com'], { nome: 'Érica Alves', nome_ordenacao: 'erica alves', email: 'erica@therion.com',
+    telefone_e164: '+5511988887777', diretoria: 'projetos', cargo: 'diretor', is_admin: true, ativo: true });
+  assert.equal(por['bia@utfpr.edu.br'].ativo, true, 'sem e-mail Therion usa o da UTFPR');
+  assert.equal(por['bia@utfpr.edu.br'].is_admin, false);
+  assert.equal(por['bia@utfpr.edu.br'].telefone_e164, null);
+  assert.equal(por['caio@therion.com'].ativo, false, 'egresso não é usuário válido');
+  assert.equal(por['caio@therion.com'].is_admin, false);
+  assert.equal(por['duda@therion.com'].diretoria, 'comercial', 'mapa do .env');
+  assert.equal(por['edu@therion.com'].ativo, false, 'data de saída passada');
+  assert.equal(por['gui@therion.com'].diretoria, 'presidencia');
+  assert.equal(por['gui@therion.com'].is_admin, true);
+  assert.ok(!por['fabi@therion.com']);
+  assert.deepEqual(preservar, ['fabi@therion.com'], 'linha com erro não desativa a pessoa');
+  assert.ok(erros.some((e) => e.linha === 8 && /data de saída/.test(e.erro)));
+  for (const v of validas) assert.ok(!('disponivel' in v) && !('canal_preferido' in v), 'campos do app não vêm da planilha');
+
+  const rel = relatorioSync({ ok: true, simulado: true, novos: [{ nome: 'A', email: 'a@x.com' }], desativados: [], admins_alterados: [], erros: [] }, erros);
+  assert.match(rel.texto, /Prévia/);
+  assert.deepEqual(rel.botoes.map((b) => b.dados), ['sync:aplicar', 'cancelar']);
+  assert.match(relatorioSync({ ok: false, codigo: 'DESATIVACAO_EM_MASSA', qtd_desativacoes: 9, ativos: 10, desativados: [] }).texto, /sync forcar/);
+  assert.equal(parseComando('/sync forcar').comando, 'sync');
 });
 
 test('ações globais têm os campos esperados', () => {
@@ -267,15 +297,11 @@ test('ações globais têm os campos esperados', () => {
   assert.equal(ACOES_GLOBAIS.pausar.campos[0].obrigatorio, true);
 });
 
-test('reatribuir: admin designa responsável de outra diretoria, que passa a poder agir na etapa', () => {
+test('reatribuir: opções restritas à diretoria da etapa; designado pode agir na etapa', () => {
   const { candidatosMembro } = require('../../lib/motor');
   const dir = [{ id: 'f1', nome: 'Fin 1' }];
-  const todos = [...dir, { id: 'p1', nome: 'Proj 1' }];
-  const admin = { id: 'a1', ativo: true, diretoria: 'comercial', is_admin: true };
-  const comum = { id: 'f2', ativo: true, diretoria: 'financeiro', is_admin: false };
-  assert.deepEqual(candidatosMembro(admin, 'reatribuir', dir, todos), todos);
-  assert.deepEqual(candidatosMembro(comum, 'reatribuir', dir, todos), dir);
-  assert.deepEqual(candidatosMembro(admin, 'outra_acao', dir, todos), dir);
+  assert.deepEqual(candidatosMembro(dir), dir);
+  assert.deepEqual(candidatosMembro(undefined), []);
 
   const etapa = { diretoria_responsavel: 'financeiro', responsavel_atribuido_id: 'p1', responsavel_nome: 'Proj 1', terminal: false };
   const tr = { tipo: 'qualquer_transicao', classe: 'transicao' };
@@ -283,4 +309,55 @@ test('reatribuir: admin designa responsável de outra diretoria, que passa a pod
   assert.equal(podeExecutar(p1, { status: 'ativo' }, etapa, tr, cfg).ok, true);
   assert.equal(podeExecutar({ ...p1, id: 'p2' }, { status: 'ativo' }, etapa, tr, cfg).ok, false);
   assert.equal(podeExecutar(p1, { status: 'pausado' }, etapa, tr, cfg).ok, false, 'pré-condição de status vale');
+});
+
+test('/me: comando e perfil do membro', () => {
+  const { perfilMembro } = require('../../lib/mensagens');
+  assert.equal(parseComando('/me').comando, 'me');
+  assert.equal(parseComando('perfil').comando, 'me');
+  assert.equal(parseComando('/meus').comando, 'meus');
+  const t = perfilMembro({ nome: 'Ana Souza', diretoria: 'financeiro', cargo: 'diretor', is_admin: true,
+    email: 'ana@ej.test', telefone_e164: '+5543999990000', canal_preferido: 'telegram', canais_habilitados: ['telegram'], disponivel: true });
+  for (const s of ['Ana Souza', 'Financeiro', 'Administrador: sim', 'ana@ej.test', '+5543999990000']) assert.ok(t.includes(s), s);
+  assert.match(perfilMembro({ nome: 'X', diretoria: 'projetos' }), /Telefone: —/);
+});
+
+test('fluxograma: DOT com etapa atual, responsável, caminho, revertidas e envio como foto', () => {
+  const { gerarDot, pedidoImagem } = require('../../lib/fluxograma');
+  const { renderTelegram } = require('../../lib/render');
+  const projeto = { id: 'p', codigo: 'P-2026-0001', nome: 'Site <A&B>', tipo: 'website', status: 'ativo',
+    data_inicio: '2026-11-01T12:00:00Z', cliente: { nome: 'Cli' },
+    etapa: { chave: 'elaboracao_orcamento', responsavel_nome: 'Eva Financeiro' } };
+  const etapas = [
+    { chave: 'registro_lead', responsavel_nome: null, data_entrada: '2026-11-01T12:00:00Z', data_saida: '2026-11-01T12:00:01Z' },
+    { chave: 'definicao_escopo', responsavel_nome: 'Carla Projetos', data_entrada: '2026-11-01T12:00:01Z', data_saida: '2026-11-02T12:00:00Z' },
+    { chave: 'elaboracao_orcamento', responsavel_nome: 'Eva Financeiro', data_entrada: '2026-11-02T12:00:00Z', prazo_sla: '2026-11-03T12:00:00Z' },
+  ];
+  const acoes = [
+    { seq: 1, tipo_acao: 'criar_projeto', nome_responsavel: 'Ana', criado_em: '2026-11-01T12:00:00Z', etapa_destino_chave: 'registro_lead' },
+    { seq: 2, tipo_acao: 'enviar_para_escopo', nome_responsavel: 'Ana', criado_em: '2026-11-01T12:00:01Z', etapa_origem_chave: 'registro_lead', etapa_destino_chave: 'definicao_escopo' },
+    { seq: 3, tipo_acao: 'comentar', nome_responsavel: 'Carla', criado_em: '2026-11-01T13:00:00Z', etapa_origem_chave: 'definicao_escopo' },
+    { seq: 4, tipo_acao: 'enviar_escopo', nome_responsavel: 'Carla', criado_em: '2026-11-02T12:00:00Z', etapa_origem_chave: 'definicao_escopo', etapa_destino_chave: 'elaboracao_orcamento', revertida_por_id: 'x' },
+  ];
+  const dot = gerarDot({ projeto, template: website, acoes, etapas }, { agora: new Date('2026-11-04T12:00:00Z') });
+  assert.match(dot, /^digraph fluxo \{/);
+  assert.ok(dot.includes('ETAPA ATUAL · Elaboração do orçamento'));
+  assert.ok(dot.includes('Responsável: Eva Financeiro'));
+  assert.ok(dot.includes('Responsável: Carla Projetos'));
+  assert.ok(dot.includes('(vencido)'));
+  assert.ok(dot.includes('Site &lt;A&amp;B&gt;'), 'escapa HTML');
+  assert.ok(dot.includes('(revertida)'));
+  assert.ok(dot.includes('Comentar') || dot.includes('Comentário'), 'tabela lista ações sem troca de etapa');
+  assert.ok(!dot.includes('"abandonado"'), 'abandonado só aparece se aconteceu');
+
+  const cfgOn = lerConfig({});
+  assert.equal(cfgOn.features.fluxograma, true, 'ativado por padrão');
+  const im = pedidoImagem({ projeto, template: website, acoes, etapas }, cfgOn);
+  assert.equal(im.tipo, 'graphviz');
+  assert.equal(pedidoImagem({ projeto, template: website }, lerConfig({ FEATURE_FLUXOGRAMA: 'false' })), null);
+  const envios = renderTelegram({ canal: 'telegram', destino: '1', texto: 'oi', botoes: [{ rotulo: 'x', dados: 'y' }], imagem: im });
+  assert.equal(envios[0].telegram.metodo, 'sendPhoto');
+  assert.equal(envios[1].telegram.metodo, 'sendMessage');
+  assert.ok(envios[1].telegram.corpo.reply_markup, 'botões ficam no texto, depois da foto');
+  assert.equal(parseComando('/fluxograma P-2026-0001').comando, 'fluxograma');
 });

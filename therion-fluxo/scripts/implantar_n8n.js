@@ -18,7 +18,8 @@ const { execFileSync } = require('child_process');
 const { construir } = require('./build_workflows');
 const path = require('path');
 
-const ORDEM = ['therion-wf-99', 'therion-wf-05', 'therion-wf-06', 'therion-wf-04', 'therion-wf-02', 'therion-wf-03', 'therion-wf-01a', 'therion-wf-09'];
+// WF-09 vem antes do WF-03, que o chama no /sync.
+const ORDEM = ['therion-wf-99', 'therion-wf-05', 'therion-wf-06', 'therion-wf-04', 'therion-wf-02', 'therion-wf-09', 'therion-wf-03', 'therion-wf-01a'];
 const env = process.env;
 
 function n8n(args, entrada) {
@@ -36,7 +37,11 @@ function credenciais() {
   const sa = env.GOOGLE_SA_JSON_PATH;
   if (sa && fs.existsSync(sa)) {
     const j = JSON.parse(fs.readFileSync(sa, 'utf8'));
-    lista.push({ id: 'therion-google', name: 'Therion Google (service account)', type: 'googleApi', data: { email: j.client_email, privateKey: j.private_key } });
+    // httpNode/scopes: permite o nó HTTP do WF-09 usar esta credencial só com leitura de planilhas (e Drive, se ligado).
+    const escopos = ['https://www.googleapis.com/auth/spreadsheets.readonly'];
+    if (env.FEATURE_DRIVE !== 'false') escopos.push('https://www.googleapis.com/auth/drive');
+    lista.push({ id: 'therion-google', name: 'Therion Google (service account)', type: 'googleApi',
+      data: { email: j.client_email, privateKey: j.private_key, httpNode: true, scopes: escopos.join(' ') } });
   } else {
     // Sem service account (modo local, FEATURE_DRIVE=false): credencial de mentira só para os
     // workflows publicarem; os nós do Google nunca são executados com o Drive desligado.
@@ -63,12 +68,9 @@ function credenciais() {
   console.log(n8n(['n8n', 'import:workflow', '--separate', '--input=/workflows']).trim().split('\n').pop());
 
   let falhas = 0;
-  // WF-09 é agendado e lê o Google Sheets: sem planilha configurada só geraria erros a cada 15 min.
-  const ordem = env.SHEETS_MEMBROS_ID ? ORDEM : ORDEM.filter((id) => id !== 'therion-wf-09');
-  if (ordem !== ORDEM) {
-    console.log('SHEETS_MEMBROS_ID vazio: WF-09 (sync de membros) não será publicado.');
-    try { n8n(['n8n', 'unpublish:workflow', '--id=therion-wf-09']); } catch { /* nunca publicado */ }
-  }
+  // WF-09 é sempre publicado (o WF-03 o chama no /sync). Sem SHEETS_MEMBROS_ID, o cron não faz nada.
+  const ordem = ORDEM;
+  if (!env.SHEETS_MEMBROS_ID) console.log('SHEETS_MEMBROS_ID vazio: o sync de membros fica inativo até a planilha ser configurada.');
   for (const id of ordem) {
     try { n8n(['n8n', 'publish:workflow', `--id=${id}`]); console.log(`publicado: ${id}`); } catch (e) {
       falhas += 1;

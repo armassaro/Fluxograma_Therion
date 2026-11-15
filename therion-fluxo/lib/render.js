@@ -34,14 +34,28 @@ function tecladoTelegram(botoes) {
   };
 }
 
+/**
+ * Imagem (fluxograma): o WF-05 renderiza `imagem.fonte` no Kroki e envia com sendPhoto
+ * (multipart). Vai ANTES do texto, para os botões ficarem na última mensagem.
+ */
+function renderImagemTelegram(msg) {
+  const im = msg.imagem;
+  return {
+    canal: 'telegram', membro_id: msg.membro_id || null, registrar: false,
+    imagem: { tipo: im.tipo || 'graphviz', fonte: im.fonte, arquivo: im.arquivo || 'fluxograma.png' },
+    telegram: { metodo: 'sendPhoto', corpo: { chat_id: msg.destino, caption: String(im.legenda || '').slice(0, 1024) } },
+  };
+}
+
 function renderTelegram(msg) {
   const partes = dividirTexto(msg.texto || ' ');
-  return partes.map((texto, i) => {
+  const imagem = msg.imagem && msg.imagem.fonte ? [renderImagemTelegram(msg)] : [];
+  return imagem.concat(partes.map((texto, i) => {
     const corpo = { chat_id: msg.destino, text: texto || ' ', disable_web_page_preview: true };
     const teclado = i === partes.length - 1 ? tecladoTelegram(msg.botoes) : undefined;
     if (teclado) corpo.reply_markup = teclado;
     return { canal: 'telegram', membro_id: msg.membro_id || null, registrar: deveRegistrar(msg), telegram: { metodo: 'sendMessage', corpo } };
-  });
+  }));
 }
 
 function renderEmail(msg) {
@@ -73,4 +87,4 @@ function montarEnvios(mensagens, callback = null) {
   return envios;
 }
 
-module.exports = { montarEnvios, renderTelegram, renderEmail, dividirTexto, tecladoTelegram, LIMITE_TELEGRAM };
+module.exports = { montarEnvios, renderTelegram, renderImagemTelegram, renderEmail, dividirTexto, tecladoTelegram, LIMITE_TELEGRAM };

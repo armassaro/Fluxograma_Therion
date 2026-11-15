@@ -457,30 +457,59 @@ test('sync de membros: cria, atualiza, desativa quem saiu e reatribui etapas ór
   const cod = await criarProjeto('Site Sync');
   const r0 = ultimaCriacao;
   const responsavel = r0.resultado.projeto.etapa.responsavel_nome;
-  const atuais = (await db.query('SELECT * FROM membros WHERE NOT is_sistema')).rows;
+  const atuais = (await db.query('SELECT * FROM membros WHERE NOT is_sistema AND ativo')).rows;
+  const nomeDir = { comercial: 'Comercial', projetos: 'Projetos', financeiro: 'Financeiro', administrativo: 'Administrativo', presidencia: 'Presidência' };
 
   // Planilha vazia (erro de leitura) não desativa ninguém.
   assert.deepEqual(await chamar(db, 'sync_membros', { linhas: [] }), { ok: false, codigo: 'PLANILHA_VAZIA' });
 
-  const planilha = atuais
-    .filter((m) => m.nome !== responsavel)                     // o responsável saiu da EJ
-    .map((m) => ({ Nome: m.nome, 'E-mail': m.email, Diretoria: m.diretoria, Cargo: m.cargo, is_admin: m.is_admin ? 'sim' : '', Ativo: 'sim', Disponivel: m.disponivel ? 'sim' : 'não' }));
-  planilha.push({ Nome: 'Zeca Novo', 'E-mail': 'zeca@ej.test', Diretoria: 'Financeiro', Telefone: '(11) 98888-7777' });
-  planilha.push({ Nome: 'Linha Ruim', 'E-mail': 'sem-arroba', Diretoria: 'comercial' });
-  const { validas, erros } = validarLinhas(planilha);
+  // Linhas no formato de lib/membros.js#montarLinhas (aba do ano).
+  const linha = (m, k) => ({ linha: k + 2, nome: m.nome, email_utfpr: '', email_therion: m.email, telefone: '', data_saida: '',
+    cargo: m.is_admin ? 'Diretor' : 'Assessor', diretoria: nomeDir[m.diretoria] });
+  const ficam = atuais.filter((m) => m.nome !== responsavel);
+  const planilha = ficam.map(linha);
+  planilha.push({ linha: 90, nome: 'Zeca Novo', email_therion: 'zeca@ej.test', telefone: '(11) 98888-7777', cargo: 'Assessor', diretoria: 'Financeiro' });
+  planilha.push({ linha: 91, nome: 'Velho Egresso', email_therion: 'velho@ej.test', cargo: 'Egresso', diretoria: 'Projetos' });
+  // Linha com diretoria errada de alguém que já existe: NÃO pode desativá-lo.
+  const protegido = ficam[0];
+  planilha[0] = { ...planilha[0], diretoria: 'Diretoria Inexistente' };
+  const { validas, erros, preservar } = validarLinhas(planilha);
   assert.equal(erros.length, 1);
-  const r = await chamar(db, 'sync_membros', { linhas: validas });
-  assert.equal(r.ok, true);
+  assert.deepEqual(preservar, [protegido.email]);
+
+  // Disponibilidade e canal são do app: o sync não mexe.
+  await db.query("UPDATE membros SET disponivel = false, canal_preferido = 'telegram' WHERE email = $1", [ficam[1].email]);
+
+  // Simulação não altera nada.
+  const antes = (await db.query('SELECT count(*)::int n FROM membros WHERE ativo')).rows[0].n;
+  const sim = await chamar(db, 'sync_membros', { linhas: validas, preservar, simular: true });
+  assert.equal(sim.ok, true); assert.equal(sim.simulado, true);
+  assert.deepEqual(sim.novos.map((n) => n.email), ['zeca@ej.test']);
+  assert.equal((await db.query('SELECT count(*)::int n FROM membros WHERE ativo')).rows[0].n, antes);
+  assert.equal((await db.query("SELECT count(*)::int n FROM membros WHERE email = 'zeca@ej.test'")).rows[0].n, 0);
+
+  // Trava de massa: tirar todo mundo da planilha é bloqueado (sem gravar nada).
+  const massa = await chamar(db, 'sync_membros', { linhas: validas.slice(-2), max_desativacoes: 2 });
+  assert.equal(massa.codigo, 'DESATIVACAO_EM_MASSA');
+  assert.equal((await db.query('SELECT count(*)::int n FROM membros WHERE ativo')).rows[0].n, antes);
+
+  const r = await chamar(db, 'sync_membros', { linhas: validas, preservar });
+  assert.equal(r.ok, true); assert.equal(r.simulado, false);
   assert.deepEqual(r.novos.map((n) => n.email), ['zeca@ej.test']);
   assert.deepEqual(r.desativados.map((n) => n.nome), [responsavel]);
+  assert.deepEqual(r.ignorados.map((n) => n.email), ['velho@ej.test'], 'egresso novo não é criado');
   assert.equal(r.reatribuicoes.length >= 1, true);
   assert.ok(r.reatribuicoes.every((x) => x.ok), JSON.stringify(r.reatribuicoes));
+  assert.equal((await db.query('SELECT ativo FROM membros WHERE email = $1', [protegido.email])).rows[0].ativo, true);
+  const pref = (await db.query('SELECT disponivel, canal_preferido FROM membros WHERE email = $1', [ficam[1].email])).rows[0];
+  assert.deepEqual(pref, { disponivel: false, canal_preferido: 'telegram' });
 
   const d = await consistente(cod);
   assert.notEqual(d.projeto.etapa.responsavel_nome, responsavel);
   assert.ok(d.projeto.etapa.responsavel_nome);
   const zeca = (await db.query("SELECT * FROM membros WHERE email = 'zeca@ej.test'")).rows[0];
   assert.equal(zeca.telefone_e164, '+5511988887777');
+  assert.equal(zeca.is_admin, false);
   // O sync não apaga vínculos do Telegram.
   const carla = (await db.query("SELECT telegram_user_id t FROM membros WHERE email = 'carla@ej.test'")).rows[0];
   assert.equal(Number(carla.t), CARLA);
@@ -488,6 +517,20 @@ test('sync de membros: cria, atualiza, desativa quem saiu e reatribui etapas ór
   const tgSaiu = Number(atuais.find((m) => m.nome === responsavel).telegram_user_id);
   const fora = await bot.diz(tgSaiu, '/meus');
   assert.equal(fora.final.resposta.codigo, 'NAO_IDENTIFICADO');
+
+  // Promoção a admin pela planilha aparece no relatório.
+  const promovido = linha({ ...zeca, is_admin: true }, 0);
+  const r2 = await chamar(db, 'sync_membros', { linhas: [...validas.filter((v) => v.email !== 'zeca@ej.test'), ...validarLinhas([promovido]).validas], preservar });
+  assert.deepEqual(r2.admins_alterados.map((x) => [x.email, x.admin]), [['zeca@ej.test', true]]);
+
+  // /sync: só admin; gera o efeito para o WF-09.
+  const naoAdmin = await bot.diz(CARLA, '/sync');
+  assert.equal(naoAdmin.final.resposta.codigo, 'NAO_AUTORIZADO');
+  const admin = await bot.diz(ADA, '/sync');
+  assert.equal(admin.final.resposta.codigo, 'SYNC_INICIADO');
+  assert.deepEqual(admin.final.efeitos.map((e) => [e.tipo, e.simular, e.forcar]), [['sync_membros', true, false]]);
+  const aplicar = await bot.clica(ADA, 'sync:aplicar');
+  assert.deepEqual(aplicar.final.efeitos.map((e) => [e.simular, e.forcar]), [[false, false]]);
 });
 
 test('consultas nomeadas (sql/consultas.sql) e views (sql/views.sql)', async () => {

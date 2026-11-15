@@ -25,6 +25,7 @@ const { ehSuper } = require('./autorizacao');
 const { montarNotificacoes } = require('./notificacoes');
 const { normalizar, nomeDiretoria, fmtMoeda } = require('./texto');
 const M = require('./mensagens');
+const { pedidoImagem } = require('./fluxograma');
 const { resp } = M;
 
 const CANAIS_PREFERIDOS = ['telegram', 'email'];
@@ -45,8 +46,10 @@ function interpretarEntrada(cmd) {
     if (cb.startsWith('val:')) return { ...base, comando: null, texto: cb.slice(4) };
     const [k, a, b] = cb.split(':');
     if (k === 'proj') return { ...base, comando: 'projeto', args: { ...base.args, projeto_codigo: a } };
+    if (k === 'flux') return { ...base, comando: 'fluxograma', args: { ...base.args, projeto_codigo: a } };
     if (k === 'hist') return { ...base, comando: 'historico', args: { ...base.args, projeto_codigo: a } };
     if (k === 'acao') return { ...base, comando: 'acao', args: { ...base.args, projeto_codigo: a, tipo_acao: b } };
+    if (k === 'sync') return { ...base, comando: 'sync', args: { ...base.args, resto: a } };
     if (k === 'cmd') return { ...base, comando: a };
     return { ...base, comando: null };
   }
@@ -108,7 +111,7 @@ function camposDialogo(sessao, dados, membro) {
   if (!def) return null;
   const campos = def.campos.filter((c) => !c.sistema).map((c) => (c.tipo === 'membro'
     ? { ...c, tipo: 'enum',
-      opcoes: candidatosMembro(membro, sessao.tipo_acao, dados.membros_diretoria, dados.membros_ativos).map((m) => m.nome) }
+      opcoes: candidatosMembro(dados.membros_diretoria).map((m) => m.nome) }
     : c));
   if (!['comentar', 'reverter', 'retomar'].includes(sessao.tipo_acao)) {
     campos.push({ nome: 'observacoes', rotulo: 'Observações', tipo: 'text', obrigatorio: false });
@@ -178,7 +181,7 @@ function argsPlano(sessao, pre, dados, cfg) {
   const { observacoes, ...campos } = sessao.campos;
   return {
     membro: pre.ctx.membro, projeto: dados.projeto, template: dados.template, acoes: dados.acoes,
-    membrosDiretoria: dados.membros_diretoria, membrosAtivos: dados.membros_ativos, tipoAcao: sessao.tipo_acao, campos,
+    membrosDiretoria: dados.membros_diretoria, tipoAcao: sessao.tipo_acao, campos,
     arquivos: sessao.arquivos, observacoes, canal: pre.cmd.canal,
     idempotencyKey: pre.cmd.idempotency_key, cfg,
   };
@@ -323,7 +326,10 @@ function cmdProjeto(membro, dados, cfg) {
       ? '\n\nProjeto pausado: retome para poder avançar.'
       : `\n\nAguardando ação da diretoria ${nomeDiretoria(projeto.etapa.diretoria_responsavel)}.`;
   }
-  return resp(true, 'OK', texto, botoes);
+  const r = resp(true, 'OK', texto, botoes);
+  const imagem = pedidoImagem(dados, cfg);   // fluxograma visual vai junto (antes do texto)
+  if (imagem) r.imagem = imagem;
+  return r;
 }
 
 function iniciarAcao(pre, dados, cfg) {
@@ -449,7 +455,23 @@ function processar(pre, dados, cfg) {
 
   // --- qualquer outro comando começa do zero (descarta diálogo anterior)
   switch (c) {
-    case 'ajuda': return fim(resp(true, 'OK', `Olá, ${membro.nome.split(' ')[0]}!\n${M.AJUDA}`));
+    case 'ajuda': return fim(resp(true, 'OK', `Olá, ${membro.nome.split(' ')[0]}!\n${M.AJUDA}`
+      + (ehSuper(membro) ? `\n\nAdministradores:\n${M.AJUDA_ADMIN}` : '')));
+    case 'sync': {
+      if (!ehSuper(membro)) return fim(resp(false, 'NAO_AUTORIZADO', 'Só administradores ou a Presidência podem sincronizar os membros.'));
+      const modo = normalizar(entrada.args.resto);
+      const aplicar = modo === 'aplicar' || modo === 'aplicarforcado';
+      const forcar = modo === 'forcar' || modo === 'aplicarforcado';
+      return {
+        resposta: resp(true, 'SYNC_INICIADO', aplicar
+          ? '🔄 Aplicando a planilha de membros... o relatório chega em instantes.'
+          : '🔄 Lendo a planilha de membros (prévia: nada é alterado ainda)...'),
+        sessao: null, operacao: null,
+        efeitos: [{ tipo: 'sync_membros', simular: !aplicar, forcar,
+          solicitante: { canal: pre.cmd.canal, destino: String(pre.cmd.chat_id || pre.cmd.id_externo_remetente), membro_id: membro.id } }],
+      };
+    }
+    case 'me': return fim(resp(true, 'OK', M.perfilMembro(membro)));
     case 'meus': return fim(cmdMeus(membro, dados));
     case 'projetos': return fim(cmdProjetos(dados, entrada.args.resto));
     case 'projeto':
@@ -461,8 +483,15 @@ function processar(pre, dados, cfg) {
       if (!dados.projeto) return fim(resp(false, 'PROJETO_NAO_ENCONTRADO', M.mensagemErro('PROJETO_NAO_ENCONTRADO')));
       return fim(resp(true, 'OK', M.formatarHistorico(dados.projeto, dados.acoes, dados.template),
         [{ rotulo: '📁 Ver projeto', dados: `proj:${dados.projeto.codigo}` }]));
-    case 'fluxograma':
-      return fim(resp(false, 'FUNCAO_DESATIVADA', 'O fluxograma em imagem chega na Fase 3. Por enquanto, use /historico.'));
+    case 'fluxograma': {
+      if (!entrada.args.projeto_codigo) return fim(semProjeto(membro, dados, entrada, 'flux'));
+      if (!dados.projeto) return fim(resp(false, 'PROJETO_NAO_ENCONTRADO', M.mensagemErro('PROJETO_NAO_ENCONTRADO')));
+      const imagem = pedidoImagem(dados, cfg);
+      if (!imagem) return fim(resp(false, 'FUNCAO_DESATIVADA', 'O fluxograma em imagem está desativado (FEATURE_FLUXOGRAMA). Use /historico.'));
+      const r = resp(true, 'OK', `Fluxograma de ${dados.projeto.codigo}.`, [{ rotulo: '📁 Ver projeto', dados: `proj:${dados.projeto.codigo}` }]);
+      r.imagem = imagem;
+      return fim(r);
+    }
     case 'novo': {
       if (!(ehSuper(membro) || membro.diretoria === 'comercial')) {
         return fim(resp(false, 'NAO_AUTORIZADO', 'Só a diretoria Comercial (ou administradores) registra novos projetos.'));
@@ -497,7 +526,7 @@ function processar(pre, dados, cfg) {
  * @returns {{resposta:object|null, sessao:object|null, notificacoes:object[], efeitos:object[]}}
  */
 function concluir(pre, saida, resultado, cfg) {
-  const base = { resposta: saida.resposta, sessao: saida.sessao, notificacoes: [], efeitos: [] };
+  const base = { resposta: saida.resposta, sessao: saida.sessao, notificacoes: [], efeitos: [...(saida.efeitos || [])] };
   if (!saida.operacao) return base;
   const fn = saida.operacao.fn;
   const meta = saida.meta || {};
@@ -571,6 +600,7 @@ function mensagensDeSaida(pre, final) {
     msgs.push({
       canal: pre.cmd.canal, destino: pre.cmd.chat_id || pre.cmd.id_externo_remetente,
       membro_id: pre.membro_id, texto: final.resposta.mensagem, botoes: final.resposta.botoes || [], resposta_direta: true,
+      ...(final.resposta.imagem ? { imagem: final.resposta.imagem } : {}),
     });
   }
   return msgs.concat(final.notificacoes || []);
